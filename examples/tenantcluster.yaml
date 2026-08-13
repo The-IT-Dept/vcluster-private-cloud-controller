@@ -1,0 +1,39 @@
+# A complete TenantCluster registration for one guest. All names and domains
+# here are examples; the credential Secret is created separately:
+#
+#   kubectl -n vcluster-cloud-controller create secret generic tenant-a-kubeconfig \
+#     --from-file=kubeconfig=./tenant-a.yaml
+#
+# For a vCluster guest, set the kubeconfig's `server` to the vcluster's
+# in-cluster Service (https://<name>.<namespace>.svc) so the syncer reaches it
+# without leaving the host.
+apiVersion: vcluster.the-it-dept.io/v1alpha1
+kind: TenantCluster
+metadata:
+  name: tenant-a
+  namespace: vcluster-cloud-controller
+spec:
+  kubeconfigSecretRef:
+    name: tenant-a-kubeconfig
+    key: kubeconfig
+
+  # The namespace holding the guest's VM (virt-launcher) pods — host Services
+  # select pods by label and can only reach pods in their own namespace.
+  hostNamespace: tenant-a-vms
+
+  nodeSelector:
+    matchLabels:
+      cluster.x-k8s.io/cluster-name: tenant-a
+      cluster.x-k8s.io/role: worker
+
+  # Hostname authority. Wildcards match exactly one label.
+  allowedDomains:
+    - tenant-a.example.com
+    - "*.tenant-a.example.com"
+
+  ingressClassName: nginx
+
+  sync:
+    services: true
+    ingresses: true
+    gateways: true

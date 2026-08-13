@@ -1,0 +1,5 @@
+image:
+  tag: test-tag
+pollInterval: 20s
+leaderElection: true
+replicas: 2

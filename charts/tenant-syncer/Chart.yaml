@@ -1,0 +1,28 @@
+apiVersion: v2
+# Same chart NAME as the 0.x series, deliberately: 1.x is this project's own
+# tenant syncer, 0.x is the deprecated wrapper around the upstream
+# kubevirt-cloud-controller-manager. Consumers pin a major version; the OCI
+# repository stays in one place.
+name: vcluster-private-cloud-controller
+description: >-
+  The tenant syncer: LoadBalancer Services, Ingress and Gateway API for
+  private-nodes vCluster guest clusters, materialised entirely on the host
+  cluster. One controller on the host watches each registered guest through a
+  kubeconfig held host-side, creates host equivalents in the tenant's host
+  namespace, validates every hostname against the tenant's allowed domains,
+  and writes addresses back into the guest. Nothing is installed inside any
+  guest, and no guest ever holds a credential to the host.
+type: application
+version: 1.0.0
+# appVersion is the controller image tag this chart is validated against.
+appVersion: v1.0.0
+home: https://github.com/the-it-dept/vcluster-private-cloud-controller
+sources:
+  - https://github.com/the-it-dept/vcluster-private-cloud-controller
+keywords:
+  - vcluster
+  - kubevirt
+  - loadbalancer
+  - ingress
+  - gateway-api
+  - multi-tenant

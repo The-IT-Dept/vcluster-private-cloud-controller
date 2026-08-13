@@ -1,0 +1,25 @@
+The tenant syncer is running. Register a guest cluster by creating a
+TenantCluster and a Secret holding a kubeconfig INTO that guest:
+
+  kubectl -n {{ .Release.Namespace }} create secret generic tenant-a-kubeconfig \
+    --from-file=kubeconfig=./tenant-a.yaml
+
+  apiVersion: vcluster.the-it-dept.io/v1alpha1
+  kind: TenantCluster
+  metadata:
+    name: tenant-a
+    namespace: {{ .Release.Namespace }}
+  spec:
+    kubeconfigSecretRef:
+      name: tenant-a-kubeconfig
+    hostNamespace: tenant-a-vms        # must hold the guest's VM pods
+    nodeSelector:
+      matchLabels:
+        cluster.x-k8s.io/cluster-name: tenant-a
+        cluster.x-k8s.io/role: worker
+    allowedDomains:
+      - tenant-a.example.com
+      - "*.tenant-a.example.com"
+    ingressClassName: nginx
+
+Then check:  kubectl -n {{ .Release.Namespace }} get tenantclusters

@@ -1,0 +1,29 @@
+image:
+  repository: ghcr.io/the-it-dept/vcluster-private-cloud-controller
+  # Defaults to the chart's appVersion.
+  tag: ""
+  pullPolicy: IfNotPresent
+
+# How often each guest cluster is fully re-synced. Host-side changes (LB
+# address assignment) are watched and act immediately; this bounds how long a
+# change made INSIDE a guest waits.
+pollInterval: 15s
+
+replicas: 1
+
+# Leader election matters only above one replica.
+leaderElection: false
+
+resources:
+  requests:
+    cpu: 50m
+    memory: 96Mi
+  limits:
+    memory: 256Mi
+
+nodeSelector: {}
+tolerations: []
+affinity: {}
+
+# Extra labels for all rendered resources.
+commonLabels: {}

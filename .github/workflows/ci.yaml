@@ -9,24 +9,75 @@ on:
 env:
   UPSTREAM_IMAGE: quay.io/kubevirt/kubevirt-cloud-controller-manager
   MIRROR_IMAGE: ghcr.io/the-it-dept/kubevirt-cloud-controller-manager
-  CHART_DIR: charts/vcluster-private-cloud-controller
+  SYNCER_IMAGE: ghcr.io/the-it-dept/vcluster-private-cloud-controller
+  CCM_CHART_DIR: charts/vcluster-private-cloud-controller
+  SYNCER_CHART_DIR: charts/tenant-syncer
 
 jobs:
+  go-test:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-go@v5
+        with:
+          go-version-file: go.mod
+      - name: Vet and test
+        run: |
+          go vet ./...
+          go test ./...
+      - name: Build
+        run: CGO_ENABLED=0 go build -o /dev/null ./cmd
+
   lint-test:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
       - uses: azure/setup-helm@v4
-      - name: Lint
-        run: helm lint "$CHART_DIR" --values "$CHART_DIR/ci/test-values.yaml"
+      - name: Lint charts
+        run: |
+          helm lint "$CCM_CHART_DIR" --values "$CCM_CHART_DIR/ci/test-values.yaml"
+          helm lint "$SYNCER_CHART_DIR" --values "$SYNCER_CHART_DIR/ci/test-values.yaml"
       - name: Template tests
         run: |
           pip install pyyaml
           bash hack/template-test.sh
+          bash hack/template-test-syncer.sh
 
-  # Mirror the pinned upstream image (tag = chart appVersion) to ghcr.io so
-  # deployments don't depend on quay availability. crane preserves the
-  # multi-arch manifest list; re-running on an existing tag is a no-op copy.
+  build-image:
+    if: github.event_name == 'push'
+    needs: [go-test, lint-test]
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      packages: write
+    steps:
+      - uses: actions/checkout@v4
+      - uses: docker/setup-buildx-action@v3
+      - uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+      - id: meta
+        uses: docker/metadata-action@v5
+        with:
+          images: ${{ env.SYNCER_IMAGE }}
+          tags: |
+            type=sha,prefix=sha-
+            type=ref,event=tag
+            type=raw,value=latest,enable={{is_default_branch}}
+      - uses: docker/build-push-action@v6
+        with:
+          context: .
+          platforms: linux/amd64
+          push: true
+          tags: ${{ steps.meta.outputs.tags }}
+          labels: ${{ steps.meta.outputs.labels }}
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
+
+  # Mirror the pinned upstream CCM image (tag = 0.x chart appVersion) so the
+  # deprecated chart keeps working without depending on quay availability.
   mirror-image:
     if: github.event_name == 'push'
     needs: lint-test
@@ -40,14 +91,14 @@ jobs:
       - name: Mirror upstream image to ghcr.io
         run: |
           set -euo pipefail
-          TAG="$(awk '/^appVersion:/ {print $2}' "$CHART_DIR/Chart.yaml")"
+          TAG="$(awk '/^appVersion:/ {print $2}' "$CCM_CHART_DIR/Chart.yaml")"
           echo "Mirroring $UPSTREAM_IMAGE:$TAG -> $MIRROR_IMAGE:$TAG"
           crane auth login ghcr.io -u "${{ github.actor }}" -p "${{ secrets.GITHUB_TOKEN }}"
           crane copy "$UPSTREAM_IMAGE:$TAG" "$MIRROR_IMAGE:$TAG"
 
-  publish-chart:
+  publish-charts:
     if: github.event_name == 'push'
-    needs: [lint-test, mirror-image]
+    needs: [go-test, lint-test, build-image]
     runs-on: ubuntu-latest
     permissions:
       contents: read
@@ -55,9 +106,12 @@ jobs:
     steps:
       - uses: actions/checkout@v4
       - uses: azure/setup-helm@v4
-      - name: Push chart to ghcr.io
+      - name: Push charts to ghcr.io
         run: |
           set -euo pipefail
           echo "${{ secrets.GITHUB_TOKEN }}" | helm registry login ghcr.io -u "${{ github.actor }}" --password-stdin
-          helm package "$CHART_DIR" -d /tmp/chart-out
-          helm push /tmp/chart-out/*.tgz oci://ghcr.io/the-it-dept/charts
+          helm package "$CCM_CHART_DIR" -d /tmp/chart-out
+          helm package "$SYNCER_CHART_DIR" -d /tmp/chart-out
+          for c in /tmp/chart-out/*.tgz; do
+            helm push "$c" oci://ghcr.io/the-it-dept/charts
+          done

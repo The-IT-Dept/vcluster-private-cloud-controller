@@ -1,26 +1,251 @@
 # vcluster-private-cloud-controller
 
-`type: LoadBalancer` Services for **private-nodes vCluster guest clusters whose
-nodes are KubeVirt VMs**, with every address allocated and routed by the
-**host** cluster.
+Platform networking for **private-nodes vCluster guest clusters whose nodes
+are KubeVirt VMs**, provided entirely by the **host** cluster.
+
+This repository ships two things, versioned apart:
+
+| series | what it is | status |
+|---|---|---|
+| **1.x — the tenant syncer** | Our own host-side controller: LoadBalancer Services, **Ingress**, and **Gateway API** for guest clusters, with per-tenant hostname authority. | current |
+| **0.x — upstream CCM wrapper** | A Helm chart deploying the upstream `kubevirt-cloud-controller-manager`, one per guest, LoadBalancer only. | **deprecated** — kept until every deployment has moved to 1.x |
+
+Both are published as OCI charts under the same name
+(`oci://ghcr.io/the-it-dept/charts/vcluster-private-cloud-controller`); pin the
+major version you want.
+
+---
+
+## 1.x — the tenant syncer
+
+### The security property, which is the whole point
+
+**Trust flows one way: the provider can reach into a tenant; a tenant can
+never reach the host.**
+
+The syncer runs on the **host**, in the provider's namespace, and holds one
+kubeconfig **per guest** — a credential INTO each guest. Nothing is installed
+inside any guest. No host kubeconfig, no host token, no host service account
+ever exists in a guest.
+
+This is not a preference. A customer has **cluster-admin on their own
+cluster** by design, so any credential placed in a guest is a credential the
+customer holds. The upstream CCM's normal deployment model — running in the
+tenant with an infrastructure kubeconfig — hands every tenant a way into the
+provider's cluster. This controller exists to avoid that pattern (our 0.x
+chart already ran the CCM host-side; 1.x keeps that direction and extends it
+past LoadBalancers).
+
+Enforced in code, not convention:
+
+- The `TenantCluster` API has a field for the credential into the guest and
+  **no field for the reverse**.
+- The syncer never creates a Secret in a guest and never writes host
+  connection details there. Its guest-facing writes are statuses, conditions,
+  events, annotations and finalizers — a guest learns its addresses and the
+  reasons for refusals, never credentials.
+- The syncer **only ever deletes host objects carrying its own ownership
+  labels**, re-checked object by object at the moment of deletion.
+
+### How it works
+
+```
+guest cluster (vCluster, private nodes = KubeVirt VMs)
+  Service / Ingress / Gateway / HTTPRoute        <- created by the tenant
+        |  watched via a guest kubeconfig held ON THE HOST
+        v
+tenant syncer (one Deployment on the host, all guests)
+        |  creates + owns (labelled) host equivalents
+        v
+host namespace holding the guest's VMs
+  Service  -> selects the tenant's virt-launcher pods, targets the guest NodePort
+  Ingress  -> host ingress class, hostnames validated, backends rewritten
+  Gateway/HTTPRoute -> same, when the host has the Gateway API
+        |  host LB / ingress controller assigns addresses
+        v
+  status written back to the GUEST resource
+```
+
+Traffic path for a LoadBalancer: client → host LB address → virt-launcher pod
+IP (with bridge binding, that **is** the VM/guest-node IP) → guest NodePort →
+guest kube-proxy → guest pod. The host Service selects the VM pods **by
+label**, so VM restarts (which change pod IPs) need no tracking.
+
+### Registering a guest: the `TenantCluster` CRD
+
+```yaml
+apiVersion: vcluster.the-it-dept.io/v1alpha1
+kind: TenantCluster
+metadata:
+  name: tenant-a
+  namespace: vcluster-cloud-controller
+spec:
+  # Credential INTO the guest. Provider -> tenant. There is no field for the
+  # reverse, and there must never be one.
+  kubeconfigSecretRef:
+    name: tenant-a-kubeconfig     # Secret in this namespace, key "kubeconfig"
+
+  # Where host-side objects go. Must be the namespace holding the guest's VM
+  # pods: a Service selector only reaches pods in its own namespace.
+  hostNamespace: tenant-a-vms
+
+  # How to find the guest's VM pods. Labels, not addresses: a VM's pod IP
+  # changes on restart; a selector survives that.
+  nodeSelector:
+    matchLabels:
+      cluster.x-k8s.io/cluster-name: tenant-a
+      cluster.x-k8s.io/role: worker
+
+  # THE HOSTNAME AUTHORITY. A guest Ingress/Gateway/HTTPRoute hostname is
+  # synced only if it matches one of these. Wildcards match ONE label:
+  # "*.tenant-a.example.com" covers "x.tenant-a.example.com" but not
+  # "x.y.tenant-a.example.com" and not "tenant-a.example.com".
+  allowedDomains:
+    - tenant-a.example.com
+    - "*.tenant-a.example.com"
+
+  ingressClassName: nginx     # host ingress class stamped on synced Ingresses
+  # gatewayClassName: host-gw # required if syncing Gateways
+
+  sync:
+    services: true
+    ingresses: true
+    gateways: true
+    # Optional: only sync guest LB Services with this loadBalancerClass.
+    # Lets the syncer coexist with another LB implementation (e.g. the 0.x
+    # CCM) serving the same guest during a migration.
+    # serviceLoadBalancerClass: vcluster.the-it-dept.io/tenant-syncer
+```
+
+Because the `TenantCluster` lives on the host, a tenant can never edit their
+own `allowedDomains` — that is what makes it an authority rather than a hint.
+
+### Hostname authority
+
+Every tenant can write any Ingress they like in their own cluster. Without
+validation, tenant A publishes an Ingress for tenant B's hostname on the
+shared host ingress. So every hostname (Ingress rule and TLS hosts, Gateway
+listener, HTTPRoute hostname) is checked against `allowedDomains`, and a
+refusal is **never silent**: the guest resource gets a Warning event and a
+durable record (a status condition on Services, an annotation
+`vcluster.the-it-dept.io/refused` on Ingress/Gateway/HTTPRoute) naming the
+hostname and the allowed domains.
+
+Refused as a matter of policy, not just non-matching: rules with **no** host,
+`defaultBackend`, and listeners with no hostname — each would capture traffic
+for every hostname the host serves, which per-domain grants cannot authorize.
+
+### Lifecycle and ownership
+
+Every host object carries ownership labels (tenant cluster, guest namespace,
+guest name, guest UID). The syncer:
+
+- deletes a host object when its guest resource goes — enforced with a
+  finalizer on the guest resource, so deletion cannot race cleanup and no
+  address is left allocated and answering;
+- deletes **everything** for a tenant when the `TenantCluster` is deleted
+  (finalizer on the `TenantCluster`), which the per-guest CCM model could
+  not do — it died with the guest before it could clean up;
+- does **nothing destructive while a guest is unreachable** — status reports
+  `connected: false` with the last sync time, host objects stay put: a
+  tenant's published address must not disappear because its API server
+  restarted;
+- **never deletes a host object lacking its ownership labels**, whatever the
+  desired state says, and never adopts or overwrites one either — a name
+  collision is reported on the `TenantCluster` and left alone.
+
+Missing optional APIs degrade cleanly: a host without the Gateway API CRDs
+gets `GatewayAPIAvailable: False` in status and the other syncers carry on.
+
+### Requirements and limits
+
+- Host: something assigning addresses to `type: LoadBalancer` Services
+  (Cilium LB-IPAM, MetalLB, cloud LB), an ingress controller, optionally the
+  Gateway API. KubeVirt guests need VM pods with routable pod-network IPs
+  (bridge binding) carrying the `nodeSelector` labels.
+- Guest workloads must be reachable via a **guest NodePort**: LoadBalancer
+  Services keep `allocateLoadBalancerNodePorts: true` (the default); Ingress
+  and HTTPRoute backends must be `NodePort` (or LoadBalancer) Services. The
+  guest's ClusterIP network does not exist on the host.
+- Guest TLS Secrets are **not** copied to the host. Host-side issuance (e.g.
+  cert-manager on the ingress class) is the supported path; moving private
+  keys between trust domains would need an explicit opt-in that does not
+  exist yet.
+- Guest Service annotations are **not** forwarded to host Services: on the
+  host they are instructions to host controllers (address-pool selection),
+  and a tenant must not steer those.
+- `externalTrafficPolicy: Local` is not propagated; client source IPs are not
+  preserved through the guest NodePort hop either way.
+
+### Install
+
+```sh
+helm install tenant-syncer \
+  oci://ghcr.io/the-it-dept/charts/vcluster-private-cloud-controller \
+  --version '^1.0.0' \
+  --namespace vcluster-cloud-controller --create-namespace
+```
+
+Then create a kubeconfig Secret and a `TenantCluster` per guest (see above).
+For a vCluster guest, point the kubeconfig's `server` at the vcluster's
+in-cluster Service (`https://<name>.<namespace>.svc`).
+
+```sh
+kubectl -n vcluster-cloud-controller get tenantclusters
+NAME       CONNECTED   SERVICES   INGRESSES   AGE
+tenant-a   true        2          1           5m
+```
+
+### Decision record (1.x): why we replaced the upstream CCM we had just adopted
+
+The 0.x decision below was correct for what it evaluated: for LoadBalancer
+Services alone, upstream was the better mechanism, and it was proved live.
+What changed is the requirement, not the assessment:
+
+1. **The cloud-provider interface stops at LoadBalancers and node lifecycle.**
+   Ingress and Gateway API are not in it and never will be. The product needs
+   hostname-based routing, which means a controller that watches guest
+   Ingress/Gateway objects — something a CCM structurally cannot grow into.
+2. **Multi-tenant hostname authority has to live somewhere.** The moment
+   guest Ingresses materialise on a shared host ingress, some component must
+   decide which tenant may claim which hostname. That is a policy decision
+   tied to tenant registration, which is exactly what the `TenantCluster`
+   CRD is.
+3. **One process for all guests, with teardown.** The per-guest CCM model
+   leaks host Services when a guest cluster is deleted (the controller dies
+   before it can clean up — documented as an operational note in 0.x). A
+   single registration-driven controller can hold a finalizer on the
+   registration and guarantee cleanup.
+4. **What 1.x keeps from upstream's design:** selector-based endpoints
+   (labels on VM pods, no address tracking), NodePort targeting, status
+   write-back, finalizer-based release — the mechanisms 0.x validated in
+   production are all retained; they are just implemented once, host-side,
+   behind a CRD.
+
+The 0.x chart remains published and deployable until 1.x has displaced it
+everywhere it runs.
+
+---
+
+## 0.x — upstream CCM wrapper (**deprecated**)
+
+> **Deprecated:** superseded by the 1.x tenant syncer above, which covers
+> LoadBalancers via the same host-side mechanism plus Ingress and Gateway
+> API. 0.x remains published for existing deployments; no new features.
+
+`type: LoadBalancer` Services for private-nodes vCluster guests, deployed as
+one upstream
+[kubevirt/cloud-provider-kubevirt](https://github.com/kubevirt/cloud-provider-kubevirt)
+cloud-controller-manager per guest cluster, running on the host.
 
 A private-nodes vCluster has no cloud provider that implements LoadBalancer:
 a `type: LoadBalancer` Service created inside the guest sits `<pending>`
 forever. The vendor-suggested alternative — running MetalLB *inside* each
 guest — puts address allocation in tenant hands, which is exactly what a
-multi-tenant host cannot allow. This project keeps allocation on the host: the
-host's own LoadBalancer implementation (Cilium, MetalLB, a cloud LB — anything
-that assigns addresses to host Services) remains the single IPAM authority.
+multi-tenant host cannot allow. This chart keeps allocation on the host: the
+host's own LoadBalancer implementation remains the single IPAM authority.
 
-## What this repo is
-
-A Helm chart (plus a container-image mirror) that deploys the **upstream
-[kubevirt/cloud-provider-kubevirt](https://github.com/kubevirt/cloud-provider-kubevirt)**
-cloud-controller-manager, one instance per guest cluster, configured for the
-vCluster private-nodes topology. We evaluated writing our own controller and
-chose the upstream project instead — see the decision record below.
-
-## How it works
+### How it works (0.x)
 
 ```
 guest cluster (vCluster, private nodes = KubeVirt VMs)
@@ -39,21 +264,12 @@ host cluster, namespace containing the guest's VMs
   status written back to the GUEST Service's status.loadBalancer.ingress
 ```
 
-Traffic path: external client → host LB address → virt-launcher pod IP
-(which, with bridge binding, **is** the VM/guest-node IP) → guest NodePort →
-guest kube-proxy → guest pod.
-
-Because the host Service uses a **label selector on the virt-launcher pods**
-rather than hand-written endpoint IPs, it survives VM restarts: a restarted VM
-gets a new pod with a new IP, the selector picks it up, and the endpoints
-follow automatically.
-
 Deletion is handled by the standard Kubernetes service controller running
 inside the CCM: it puts the `service.kubernetes.io/load-balancer-cleanup`
 finalizer on the guest Service, and deleting the guest Service deletes the
 host Service, which releases the address back to the host pool.
 
-## Decision record: why upstream, not a bespoke controller
+### Decision record (0.x): why upstream, not a bespoke controller
 
 Evaluated 2026-08 against a working hand-built prototype (host Service with no
 selector + hand-written EndpointSlice pointing at guest-node-IP:NodePort).
@@ -77,7 +293,7 @@ selector + hand-written EndpointSlice pointing at guest-node-IP:NodePort).
    multi-arch images published per release.
 
 **Adaptations needed for vCluster private nodes** (configuration only, no
-forking — all encoded in this chart):
+forking — all encoded in the chart):
 
 - **Only the `service` controller is enabled.** vCluster's embedded cloud
   provider owns guest-node initialisation and lifecycle and sets
@@ -91,62 +307,23 @@ forking — all encoded in this chart):
   so there is no overlap in the other direction.
 - **VM labels are your job.** Upstream selects VM pods by the Cluster API
   labels; vCluster's node provisioning does not add them. Put them on every
-  guest-node VirtualMachine (see below).
+  guest-node VirtualMachine.
 - **One CCM Deployment per guest cluster** (upstream's model). The chart makes
   this declarative: a `clusters:` list, one Deployment + ConfigMap per entry.
 - `--leader-elect=false` with a single replica, so no lease is written into
   the guest's kube-system beside vCluster's own components.
 
-**What would have justified writing our own** (and did not apply): needing a
-single multi-cluster controller process, needing EndpointSlice mode with
-continuous node-address tracking, or upstream being unmaintained.
+**What would have justified writing our own** (and did not apply at the time):
+needing a single multi-cluster controller process, needing EndpointSlice mode
+with continuous node-address tracking, or upstream being unmaintained. *(See
+the 1.x decision record above for what did, later, justify it: Ingress and
+Gateway API, which are outside the cloud-provider interface entirely.)*
 
-## Requirements
-
-- Host cluster with KubeVirt, and something that assigns addresses to host
-  `type: LoadBalancer` Services (Cilium LB-IPAM pools, MetalLB, cloud LB...).
-- Guest clusters whose nodes are KubeVirt VMs with a **routable pod-network
-  IP** (e.g. bridge binding on the pod network: the VM inherits the
-  virt-launcher pod IP, so `node-IP:NodePort` is reachable from the host
-  datapath).
-- A kubeconfig per guest cluster, reachable from host pods. For a vCluster,
-  point it at the vcluster's in-cluster Service
-  (`https://<vcluster-name>.<vcluster-namespace>.svc`) rather than a public
-  hostname.
-- Guest Services must keep `allocateLoadBalancerNodePorts: true` (the
-  default) — the host Service targets the guest NodePort.
-
-## Install
-
-### 1. Label the guest-node VMs
-
-On every VirtualMachine backing a guest node, in
-`spec.template.metadata.labels` (KubeVirt copies these to each virt-launcher
-pod it creates, so they survive VM restarts):
-
-```yaml
-cluster.x-k8s.io/cluster-name: tenant-a   # must equal the chart's clusterName
-cluster.x-k8s.io/role: worker
-```
-
-For an already-running VM, also add the same labels directly to the current
-virt-launcher **pod** (KubeVirt does not live-sync VMI label changes onto an
-existing pod) — or simply restart the VM.
-
-### 2. Create the guest kubeconfig Secret
-
-```sh
-kubectl -n cloud-controller create secret generic tenant-a-guest-kubeconfig \
-  --from-file=kubeconfig=./tenant-a.yaml   # server: https://<vcluster>.<ns>.svc
-```
-
-(For a vCluster, derive this from the platform-managed kubeconfig Secret and
-rewrite `server` to the in-cluster Service URL.)
-
-### 3. Install the chart
+### Install (0.x)
 
 ```sh
 helm install vpcc oci://ghcr.io/the-it-dept/charts/vcluster-private-cloud-controller \
+  --version '^0.1.0' \
   --namespace cloud-controller --create-namespace \
   --values my-values.yaml
 ```
@@ -161,46 +338,39 @@ clusters:
       key: kubeconfig
 ```
 
-See [examples/guest-cluster-values.yaml](examples/guest-cluster-values.yaml)
-and [charts/.../values.yaml](charts/vcluster-private-cloud-controller/values.yaml)
-for all options.
+Label every guest-node VirtualMachine in `spec.template.metadata.labels` with
+`cluster.x-k8s.io/cluster-name: <name>` and `cluster.x-k8s.io/role: worker`
+(KubeVirt copies these to each virt-launcher pod). See
+[examples/guest-cluster-values.yaml](examples/guest-cluster-values.yaml).
 
-### 4. Use it
-
-Inside the guest:
-
-```sh
-kubectl create deployment echo --image=ealen/echo-server --port=80
-kubectl expose deployment echo --port=80 --type=LoadBalancer
-kubectl get svc echo    # EXTERNAL-IP appears within seconds, from the HOST pool
-```
-
-`kubectl delete svc echo` deletes the host-side Service and releases the
-address.
-
-## Operational notes
+### Operational notes (0.x)
 
 - **Guest-cluster teardown:** deleting a guest cluster does not, by itself,
   delete host Services created for it (the CCM is gone before it can clean
   up). Remove them with the labels stamped on every managed Service:
   `kubectl -n <vmNamespace> delete svc -l cluster.x-k8s.io/cluster-name=<name>`.
-  Wire that into whatever automation deletes guest clusters.
+  The 1.x syncer closes this gap with its `TenantCluster` finalizer.
 - **`externalTrafficPolicy: Local`** on the guest Service is propagated to the
   host Service, but client source IPs are still not preserved end to end (the
   guest NodePort hop masquerades). Treat it as unsupported.
 - The CCM writes events and Service status into the guest, so the guest
   kubeconfig needs those permissions (a vCluster admin kubeconfig has them).
-- Address selection: `spec.loadBalancerIP` is copied to the host Service if
-  set. Pool-selection annotations (e.g. Cilium's) are copied too — the guest
-  Service's annotations are propagated to the host Service.
+- Address selection: `spec.loadBalancerIP` and pool-selection annotations are
+  copied from the guest Service to the host Service. *(The 1.x syncer
+  deliberately does not do this; see its limits section.)*
+
+---
 
 ## Security
 
-This chart's host-side ServiceAccount can only create/delete Services in the
-configured VM namespaces (namespaced Roles, no cluster-wide write). Guest
-kubeconfigs live in Secrets you create; nothing here ever writes credentials
-to disk or logs.
+- The 1.x syncer's ServiceAccount can read Secrets **only by name** (`get`,
+  never `list`/`watch`): a compromised syncer pod cannot enumerate host
+  Secrets. The 0.x chart's ServiceAccount is namespaced to the configured VM
+  namespaces.
+- Guest kubeconfigs live in Secrets you create on the host; nothing in this
+  repository ever writes credentials to disk, to logs, or into a guest.
+- Examples throughout use `example.com` and RFC 5737 documentation addresses.
 
 ## Licence
 
-Apache 2.0, same as the upstream project this deploys.
+Apache 2.0.

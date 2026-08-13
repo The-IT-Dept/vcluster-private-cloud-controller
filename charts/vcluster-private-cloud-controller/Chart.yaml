@@ -8,7 +8,11 @@ description: >-
   LoadBalancer only, node lifecycle left to vCluster's embedded cloud
   provider.
 type: application
-version: 0.1.3
+# Deprecated in favour of the 1.x tenant syncer chart (same OCI name, version
+# >=1.0.0), which adds Ingress and Gateway API and closes the guest-teardown
+# leak. 0.x remains published for existing deployments; no new features.
+deprecated: true
+version: 0.1.4
 # appVersion tracks the upstream kubevirt/cloud-provider-kubevirt release the
 # chart is validated against. The image mirror workflow publishes the same tag.
 appVersion: v0.6.0

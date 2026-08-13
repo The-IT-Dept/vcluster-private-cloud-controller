@@ -1,0 +1,86 @@
+# Cluster-scoped, and that is forced by the design rather than convenience:
+# each TenantCluster names its own hostNamespace, which does not exist at
+# install time, so per-namespace Roles cannot be rendered here. The verbs are
+# the narrow part — note Secrets are GET only (the per-guest kubeconfigs),
+# never list/watch: this controller cannot enumerate the host's Secrets.
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRole
+metadata:
+  name: {{ include "tenant-syncer.name" . }}
+  labels:
+    {{- include "tenant-syncer.labels" . | nindent 4 }}
+rules:
+  - apiGroups: ["vcluster.the-it-dept.io"]
+    resources: ["tenantclusters"]
+    verbs: ["get", "list", "watch", "update", "patch"]
+  - apiGroups: ["vcluster.the-it-dept.io"]
+    resources: ["tenantclusters/status", "tenantclusters/finalizers"]
+    verbs: ["get", "update", "patch"]
+  - apiGroups: [""]
+    resources: ["services"]
+    verbs: ["get", "list", "watch", "create", "update", "patch", "delete"]
+  - apiGroups: [""]
+    resources: ["secrets"]
+    verbs: ["get"]
+  - apiGroups: [""]
+    resources: ["namespaces"]
+    verbs: ["get", "create"]
+  - apiGroups: [""]
+    resources: ["events"]
+    verbs: ["create", "patch"]
+  - apiGroups: ["networking.k8s.io"]
+    resources: ["ingresses"]
+    verbs: ["get", "list", "watch", "create", "update", "patch", "delete"]
+  # Granted even where the CRDs are absent: RBAC on a missing group is inert,
+  # and installing Gateway API later must not require a chart upgrade.
+  - apiGroups: ["gateway.networking.k8s.io"]
+    resources: ["gateways", "httproutes"]
+    verbs: ["get", "list", "watch", "create", "update", "patch", "delete"]
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRoleBinding
+metadata:
+  name: {{ include "tenant-syncer.name" . }}
+  labels:
+    {{- include "tenant-syncer.labels" . | nindent 4 }}
+roleRef:
+  apiGroup: rbac.authorization.k8s.io
+  kind: ClusterRole
+  name: {{ include "tenant-syncer.name" . }}
+subjects:
+  - kind: ServiceAccount
+    name: {{ include "tenant-syncer.name" . }}
+    namespace: {{ .Release.Namespace }}
+{{- if .Values.leaderElection }}
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: Role
+metadata:
+  name: {{ include "tenant-syncer.name" . }}-leader-election
+  namespace: {{ .Release.Namespace }}
+  labels:
+    {{- include "tenant-syncer.labels" . | nindent 4 }}
+rules:
+  - apiGroups: ["coordination.k8s.io"]
+    resources: ["leases"]
+    verbs: ["get", "list", "watch", "create", "update", "patch", "delete"]
+  - apiGroups: [""]
+    resources: ["events"]
+    verbs: ["create", "patch"]
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: RoleBinding
+metadata:
+  name: {{ include "tenant-syncer.name" . }}-leader-election
+  namespace: {{ .Release.Namespace }}
+  labels:
+    {{- include "tenant-syncer.labels" . | nindent 4 }}
+roleRef:
+  apiGroup: rbac.authorization.k8s.io
+  kind: Role
+  name: {{ include "tenant-syncer.name" . }}-leader-election
+subjects:
+  - kind: ServiceAccount
+    name: {{ include "tenant-syncer.name" . }}
+    namespace: {{ .Release.Namespace }}
+{{- end }}

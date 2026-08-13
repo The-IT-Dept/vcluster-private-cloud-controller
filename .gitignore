@@ -14,3 +14,6 @@ charts/**/charts/
 .DS_Store
 .idea/
 .vscode/
+
+# Build output
+bin/

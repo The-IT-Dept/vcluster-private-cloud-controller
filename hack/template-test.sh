@@ -30,7 +30,7 @@ EOF
 # clusterName override must land in --cluster-name; controllers pinned to service.
 grep -q -- '--cluster-name=tenant-b-prod' "$OUT" || fail "clusterName override not applied"
 grep -q -- '--cluster-name=tenant-a' "$OUT" || fail "default clusterName not applied"
-grep -q -- '--controllers=service' "$OUT" || fail "controllers not pinned to service"
+grep -q -- '--controllers=service-lb-controller' "$OUT" || fail "controllers not pinned to service-lb-controller"
 grep -q -- '--leader-elect=false' "$OUT" || fail "leader election not disabled"
 
 # instancesV2 must be off — vCluster's embedded cloud provider owns nodes.

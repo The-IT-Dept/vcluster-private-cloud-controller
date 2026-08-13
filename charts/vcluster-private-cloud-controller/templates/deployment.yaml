@@ -87,12 +87,15 @@ spec:
             # whose Services it watches and whose Service status it updates.
             - --kubeconfig=/etc/kubernetes/kubeconfig/value
             - --cluster-name={{ $clusterName }}
-            # Only the service (LoadBalancer) controller. cloud-node and
+            # Only the service-lb (LoadBalancer) controller. cloud-node and
             # cloud-node-lifecycle must stay off: vCluster's embedded cloud
             # provider owns the nodes and its vcluster:// providerIDs would
             # make the kubevirt node-lifecycle controller treat every guest
-            # node as unparseable/nonexistent.
-            - --controllers={{ join "," ($cluster.controllers | default (list "service")) }}
+            # node as unparseable/nonexistent. Note: upstream registers no
+            # controller-name aliases, so the full name "service-lb-controller"
+            # is required — the kube-controller-manager-style short name
+            # "service" is rejected.
+            - --controllers={{ join "," ($cluster.controllers | default (list "service-lb-controller")) }}
             # Single replica per guest; leader election would put a lease in
             # the guest's kube-system next to vCluster's own components for
             # no benefit.

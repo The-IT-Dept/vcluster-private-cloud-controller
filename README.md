@@ -84,9 +84,11 @@ forking — all encoded in this chart):
   `providerID: vcluster://<node>`, which the kubevirt provider's InstancesV2
   cannot parse. Running the kubevirt cloud-node/cloud-node-lifecycle
   controllers against such nodes would be wrong and potentially destructive,
-  so `instancesV2` is disabled in cloud-config and `--controllers=service` is
-  pinned. vCluster's embedded provider implements no LoadBalancer for private
-  nodes, so there is no overlap in the other direction.
+  so `instancesV2` is disabled in cloud-config and
+  `--controllers=service-lb-controller` is pinned (the full controller name —
+  upstream registers no aliases, so the short name `service` is rejected).
+  vCluster's embedded provider implements no LoadBalancer for private nodes,
+  so there is no overlap in the other direction.
 - **VM labels are your job.** Upstream selects VM pods by the Cluster API
   labels; vCluster's node provisioning does not add them. Put them on every
   guest-node VirtualMachine (see below).
@@ -127,8 +129,9 @@ cluster.x-k8s.io/cluster-name: tenant-a   # must equal the chart's clusterName
 cluster.x-k8s.io/role: worker
 ```
 
-For an already-running VM, also add the same labels to the current VMI (or
-restart the VM) so the existing virt-launcher pod is selectable.
+For an already-running VM, also add the same labels directly to the current
+virt-launcher **pod** (KubeVirt does not live-sync VMI label changes onto an
+existing pod) — or simply restart the VM.
 
 ### 2. Create the guest kubeconfig Secret
 

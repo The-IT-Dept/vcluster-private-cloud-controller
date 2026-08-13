@@ -45,11 +45,12 @@ clusters: []
 #      key: kubeconfig
 #
 #    # Which cloud-controller-manager controllers to run. For vCluster
-#    # private-nodes guests keep this at just `service`: vCluster's embedded
-#    # cloud provider already owns node initialisation and lifecycle (it sets
-#    # providerID vcluster://..., which this CCM could not parse anyway).
+#    # private-nodes guests keep this at just `service-lb-controller`:
+#    # vCluster's embedded cloud provider already owns node initialisation and
+#    # lifecycle (it sets providerID vcluster://..., which this CCM could not
+#    # parse anyway).
 #    controllers:
-#      - service
+#      - service-lb-controller
 #
 #    loadBalancer:
 #      # Seconds between polls while waiting for the host Service to be

@@ -8,7 +8,7 @@ description: >-
   LoadBalancer only, node lifecycle left to vCluster's embedded cloud
   provider.
 type: application
-version: 0.1.0
+version: 0.1.2
 # appVersion tracks the upstream kubevirt/cloud-provider-kubevirt release the
 # chart is validated against. The image mirror workflow publishes the same tag.
 appVersion: v0.6.0

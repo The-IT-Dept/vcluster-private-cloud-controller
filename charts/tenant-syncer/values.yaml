@@ -4,6 +4,17 @@ image:
   tag: ""
   pullPolicy: IfNotPresent
 
+# The storage syncer deploys a CSI node plugin DaemonSet INTO each guest whose
+# TenantCluster has storage enabled and at least one host StorageClass is
+# labelled vcluster.the-it-dept.io/tenant-offerable=true. These are the images
+# it deploys there. The node image tag defaults to the chart's appVersion so
+# both halves of the split driver ship as one version.
+csiNode:
+  image:
+    repository: ghcr.io/the-it-dept/vcluster-private-cloud-controller-csi-node
+    tag: ""
+  registrarImage: registry.k8s.io/sig-storage/csi-node-driver-registrar:v2.13.0
+
 # How often each guest cluster is fully re-synced. Host-side changes (LB
 # address assignment) are watched and act immediately; this bounds how long a
 # change made INSIDE a guest waits.

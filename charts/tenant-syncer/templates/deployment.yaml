@@ -26,6 +26,8 @@ spec:
           imagePullPolicy: {{ .Values.image.pullPolicy }}
           args:
             - --poll-interval={{ .Values.pollInterval }}
+            - --csi-node-image={{ .Values.csiNode.image.repository }}:{{ .Values.csiNode.image.tag | default .Chart.AppVersion }}
+            - --csi-registrar-image={{ .Values.csiNode.registrarImage }}
             {{- if .Values.leaderElection }}
             - --leader-elect
             {{- end }}

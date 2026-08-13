@@ -56,9 +56,42 @@ if grep -qiE 'hostKubeconfig|hostCredential|hostSecret' "$CRD"; then
   fail "CRD must have no field for a reverse (guest-holds-host) credential"
 fi
 
-# Default (no values): leader election off, no Role rendered.
+# Storage RBAC. Two properties:
+#  - StorageClasses are read-only: the syncer advertises host classes, it must
+#    never be able to change them.
+#  - PVC verbs are exactly get/list/watch/create/delete — no update/patch and,
+#    critically, no deletecollection: a storage bug that mass-deletes host
+#    PVCs destroys tenant data, so the widest deletion verb is simply absent.
+python3 - "$OUT" <<'EOF'
+import sys, yaml
+docs = [d for d in yaml.safe_load_all(open(sys.argv[1])) if d]
+for d in docs:
+    if d["kind"] != "ClusterRole":
+        continue
+    for rule in d["rules"]:
+        res = rule.get("resources", [])
+        if "storageclasses" in res:
+            assert set(rule["verbs"]) <= {"get", "list", "watch"}, \
+                f"storageclasses must be read-only, got {rule['verbs']}"
+        if "persistentvolumeclaims" in res:
+            assert set(rule["verbs"]) == {"get", "list", "watch", "create", "delete"}, \
+                f"pvc verbs must be exactly get/list/watch/create/delete, got {rule['verbs']}"
+EOF
+[ $? = 0 ] || fail "storage RBAC wrong"
+
+# The CSI image flags reach the controller.
+grep -q -- '--csi-node-image=ghcr.io/the-it-dept/vcluster-private-cloud-controller-csi-node:csi-test-tag' "$OUT" \
+  || fail "csi-node-image flag not rendered from values"
+grep -q -- '--csi-registrar-image=registry.k8s.io/sig-storage/csi-node-driver-registrar:' "$OUT" \
+  || fail "csi-registrar-image flag not rendered"
+
+# Default (no values): leader election off, no Role rendered, csi node image
+# tag falls back to the chart appVersion so both halves ship as one version.
 helm template ts "$CHART" --namespace x > "$OUT"
 [ "$(count Role)" = 0 ] || fail "no Role expected with default values"
 grep -q -- '--poll-interval=15s' "$OUT" || fail "default pollInterval wrong"
+APPVER="$(awk '/^appVersion:/ {print $2}' "$CHART/Chart.yaml")"
+grep -q -- "--csi-node-image=ghcr.io/the-it-dept/vcluster-private-cloud-controller-csi-node:$APPVER" "$OUT" \
+  || fail "csi node image must default to the chart appVersion"
 
 echo "tenant-syncer template tests passed"

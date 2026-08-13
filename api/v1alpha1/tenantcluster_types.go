@@ -42,6 +42,16 @@ type SyncConfig struct {
 	Ingresses *bool `json:"ingresses,omitempty"`
 	// +optional
 	Gateways *bool `json:"gateways,omitempty"`
+	// Storage enables the storage syncer: host StorageClasses labelled
+	// tenant-offerable are mirrored into the guest, guest PVCs on those classes
+	// become host PVCs hotplugged into the VM backing whichever guest node the
+	// consuming pod runs on, and a CSI node plugin DaemonSet is installed in
+	// the guest so kubelet can mount the device. Enabled by default like the
+	// other syncers, but INERT until the operator labels at least one host
+	// StorageClass tenant-offerable — so enabling the syncer never installs
+	// anything into a guest by itself.
+	// +optional
+	Storage *bool `json:"storage,omitempty"`
 
 	// ServiceLoadBalancerClass scopes the Service syncer to guest Services whose
 	// spec.loadBalancerClass equals this value. Empty means the standard
@@ -117,6 +127,8 @@ type ResourceCounts struct {
 	Ingresses  int `json:"ingresses"`
 	Gateways   int `json:"gateways"`
 	HTTPRoutes int `json:"httpRoutes"`
+	// +optional
+	PersistentVolumeClaims int `json:"persistentVolumeClaims,omitempty"`
 }
 
 type TenantClusterStatus struct {
@@ -155,6 +167,7 @@ const (
 func (t *TenantCluster) SyncServices() bool  { return t.Spec.Sync.Services == nil || *t.Spec.Sync.Services }
 func (t *TenantCluster) SyncIngresses() bool { return t.Spec.Sync.Ingresses == nil || *t.Spec.Sync.Ingresses }
 func (t *TenantCluster) SyncGateways() bool  { return t.Spec.Sync.Gateways == nil || *t.Spec.Sync.Gateways }
+func (t *TenantCluster) SyncStorage() bool   { return t.Spec.Sync.Storage == nil || *t.Spec.Sync.Storage }
 
 // +kubebuilder:object:root=true
 // +kubebuilder:subresource:status

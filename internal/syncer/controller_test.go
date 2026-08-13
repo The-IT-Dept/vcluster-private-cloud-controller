@@ -6,8 +6,10 @@ import (
 	"testing"
 	"time"
 
+	appsv1 "k8s.io/api/apps/v1"
 	corev1 "k8s.io/api/core/v1"
 	netv1 "k8s.io/api/networking/v1"
+	storagev1 "k8s.io/api/storage/v1"
 	apierrors "k8s.io/apimachinery/pkg/api/errors"
 	"k8s.io/apimachinery/pkg/api/meta"
 	"k8s.io/apimachinery/pkg/api/meta/testrestmapper"
@@ -50,7 +52,20 @@ type fixture struct {
 	host  client.Client
 	guest client.Client
 	tc    *v1alpha1.TenantCluster
+	hot   *fakeHotplug
 }
+
+// getTC reads the TenantCluster's current state from the fake host.
+func (f *fixture) getTC(t *testing.T) *v1alpha1.TenantCluster {
+	t.Helper()
+	var tc v1alpha1.TenantCluster
+	if err := f.host.Get(context.Background(), types.NamespacedName{Name: "pn1", Namespace: "syncer"}, &tc); err != nil {
+		t.Fatalf("reading TenantCluster: %v", err)
+	}
+	return &tc
+}
+
+func dsPtr() *appsv1.DaemonSet { return &appsv1.DaemonSet{} }
 
 // newFixture wires a TenantCluster, its kubeconfig Secret, and fake clients
 // for both clusters. hostGateway controls whether the fake host "has" the
@@ -85,17 +100,20 @@ func newFixture(t *testing.T, hostGateway bool, guestObjs []client.Object, hostO
 		Build()
 	guest := fake.NewClientBuilder().WithScheme(guestScheme).
 		WithObjects(guestObjs...).
-		WithStatusSubresource(&corev1.Service{}, &netv1.Ingress{}, &gwv1.Gateway{}).
+		WithStatusSubresource(&corev1.Service{}, &netv1.Ingress{}, &gwv1.Gateway{}, &storagev1.VolumeAttachment{}).
 		Build()
 
+	hot := newFakeHotplug("node-a")
 	r := &TenantClusterReconciler{
 		Client: host, Reader: host, Scheme: hostScheme,
 		Interval: time.Second,
 		NewGuestClient: func([]byte, *runtime.Scheme) (client.Client, error) {
 			return guest, nil
 		},
+		Hotplug:   hot,
+		CSIImages: NodePluginImages{Node: "example.com/csi-node:test", Registrar: "example.com/registrar:test"},
 	}
-	return &fixture{r: r, host: host, guest: guest, tc: tc}
+	return &fixture{r: r, host: host, guest: guest, tc: tc, hot: hot}
 }
 
 func (f *fixture) reconcile(t *testing.T) {

@@ -75,6 +75,12 @@ type TenantClusterReconciler struct {
 
 	NewGuestClient GuestClientFactory
 
+	// Hotplug is the KubeVirt add/remove-volume surface for the storage
+	// syncer; CSIImages are the images it deploys into guests as the node
+	// plugin. Both injected so tests can fake the VM side.
+	Hotplug   Hotplugger
+	CSIImages NodePluginImages
+
 	// guests caches one client per TenantCluster, invalidated when the
 	// kubeconfig Secret changes. Rebuilding a client each pass would redo
 	// discovery against every guest every fifteen seconds for nothing.
@@ -96,6 +102,10 @@ type cachedGuest struct {
 // +kubebuilder:rbac:groups="",resources=events,verbs=create;patch
 // +kubebuilder:rbac:groups=networking.k8s.io,resources=ingresses,verbs=get;list;watch;create;update;patch;delete
 // +kubebuilder:rbac:groups=gateway.networking.k8s.io,resources=gateways;httproutes,verbs=get;list;watch;create;update;patch;delete
+// +kubebuilder:rbac:groups=storage.k8s.io,resources=storageclasses,verbs=get;list;watch
+// +kubebuilder:rbac:groups="",resources=persistentvolumeclaims,verbs=get;list;watch;create;delete
+// +kubebuilder:rbac:groups=kubevirt.io,resources=virtualmachines;virtualmachineinstances,verbs=get;list
+// +kubebuilder:rbac:groups=subresources.kubevirt.io,resources=virtualmachines/addvolume;virtualmachines/removevolume,verbs=update
 
 func (r *TenantClusterReconciler) Reconcile(ctx context.Context, req ctrl.Request) (ctrl.Result, error) {
 	log := logf.FromContext(ctx)
@@ -129,7 +139,7 @@ func (r *TenantClusterReconciler) Reconcile(ctx context.Context, req ctrl.Reques
 	}
 
 	gatewayAPIOnHost := r.hostHasGatewayAPI()
-	p := newPass(&tc, r.Client, r.Reader, guest, gatewayAPIOnHost, log)
+	p := newPass(&tc, r.Client, r.Reader, guest, gatewayAPIOnHost, r.Hotplug, r.CSIImages, log)
 	if err := p.run(ctx); err != nil {
 		// run only fails on guest API errors; host-side trouble lands in
 		// p.problems. An unreachable guest is DISCONNECTED, and disconnected
@@ -168,8 +178,9 @@ func (r *TenantClusterReconciler) Reconcile(ctx context.Context, req ctrl.Reques
 			fmt.Sprintf("%d hostname/backend refusal(s); details are on the guest resources", refused))
 	default:
 		setCond(&tc, v1alpha1.CondSynced, metav1.ConditionTrue, "AllSynced", fmt.Sprintf(
-			"synced %d service(s), %d ingress(es), %d gateway(s), %d route(s)",
-			p.counts.Services, p.counts.Ingresses, p.counts.Gateways, p.counts.HTTPRoutes))
+			"synced %d service(s), %d ingress(es), %d gateway(s), %d route(s), %d PVC(s)",
+			p.counts.Services, p.counts.Ingresses, p.counts.Gateways, p.counts.HTTPRoutes,
+			p.counts.PersistentVolumeClaims))
 	}
 
 	if err := r.Status().Update(ctx, &tc); err != nil {
@@ -214,6 +225,15 @@ func (r *TenantClusterReconciler) reconcileDelete(ctx context.Context, tc *v1alp
 		LabelTenantClusterNamespace: tc.Namespace,
 	}
 	inNS := client.InNamespace(tc.Spec.HostNamespace)
+
+	// Storage goes first, and can hold the teardown across passes: every host
+	// PVC must be unplugged from its VM BEFORE it is deleted, and unplug is
+	// asynchronous. Services and Ingresses have no such ordering and are
+	// deleted below regardless.
+	storageDone, err := r.storageTeardown(ctx, tc)
+	if err != nil {
+		return ctrl.Result{}, err
+	}
 
 	failed := false
 	del := func(obj client.Object) {
@@ -261,7 +281,7 @@ func (r *TenantClusterReconciler) reconcileDelete(ctx context.Context, tc *v1alp
 			}
 		}
 	}
-	if failed {
+	if failed || !storageDone {
 		return ctrl.Result{RequeueAfter: r.interval()}, nil
 	}
 
@@ -273,6 +293,7 @@ func (r *TenantClusterReconciler) reconcileDelete(ctx context.Context, tc *v1alp
 	// cluster-admin there.
 	if guest, err := r.guestClientFor(ctx, tc); err == nil {
 		r.stripGuestFinalizers(ctx, guest)
+		r.cleanupGuestStorage(ctx, guest)
 	}
 
 	r.mu.Lock()

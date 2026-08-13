@@ -1,7 +1,9 @@
 // The tenant syncer: a host-side controller that gives private-nodes vCluster
-// guests LoadBalancer Services, Ingress and Gateway API, materialised entirely
-// on the host cluster. It holds one kubeconfig INTO each guest and installs
-// nothing in any guest — see the README for why that direction is the point.
+// guests LoadBalancer Services, Ingress, Gateway API and storage, materialised
+// on the host cluster. It holds one kubeconfig INTO each guest; the only thing
+// ever installed in a guest is the credential-less CSI node plugin (this same
+// binary, `csi-node` mode) — see the README for why that direction is the
+// point.
 package main
 
 import (
@@ -24,6 +26,8 @@ import (
 	gwv1 "sigs.k8s.io/gateway-api/apis/v1"
 
 	"github.com/the-it-dept/vcluster-private-cloud-controller/api/v1alpha1"
+	"github.com/the-it-dept/vcluster-private-cloud-controller/internal/csinode"
+	"github.com/the-it-dept/vcluster-private-cloud-controller/internal/kubevirt"
 	"github.com/the-it-dept/vcluster-private-cloud-controller/internal/syncer"
 )
 
@@ -39,14 +43,30 @@ func init() {
 }
 
 func main() {
+	// The same binary is both the host-side controller and the guest-side CSI
+	// node plugin: one image family, one version, no drift between the halves.
+	// The node plugin is selected explicitly and parses its own flags — it
+	// must never accidentally start a controller inside a guest.
+	if len(os.Args) > 1 && os.Args[1] == "csi-node" {
+		csinode.Main(os.Args[2:])
+		return
+	}
+
 	var metricsAddr, probeAddr string
 	var leaderElect bool
 	var interval time.Duration
+	var csiNodeImage, csiRegistrarImage string
 	flag.StringVar(&metricsAddr, "metrics-bind-address", ":8080", "metrics endpoint bind address")
 	flag.StringVar(&probeAddr, "health-probe-bind-address", ":8081", "health probe bind address")
 	flag.BoolVar(&leaderElect, "leader-elect", false, "enable leader election")
 	flag.DurationVar(&interval, "poll-interval", syncer.DefaultInterval,
 		"how often each guest cluster is fully re-synced")
+	flag.StringVar(&csiNodeImage, "csi-node-image",
+		"ghcr.io/the-it-dept/vcluster-private-cloud-controller-csi-node:latest",
+		"image for the CSI node plugin DaemonSet deployed into guests")
+	flag.StringVar(&csiRegistrarImage, "csi-registrar-image",
+		"registry.k8s.io/sig-storage/csi-node-driver-registrar:v2.13.0",
+		"image for the CSI node-driver-registrar sidecar deployed into guests")
 	opts := zap.Options{}
 	opts.BindFlags(flag.CommandLine)
 	flag.Parse()
@@ -80,12 +100,23 @@ func main() {
 		os.Exit(1)
 	}
 
+	hotplug, err := kubevirt.New(mgr.GetConfig())
+	if err != nil {
+		setupLog.Error(err, "unable to build KubeVirt hotplug client")
+		os.Exit(1)
+	}
+
 	if err := (&syncer.TenantClusterReconciler{
 		Client:   mgr.GetClient(),
 		Reader:   mgr.GetAPIReader(),
 		Scheme:   mgr.GetScheme(),
 		Recorder: mgr.GetEventRecorderFor("tenant-syncer"),
 		Interval: interval,
+		Hotplug:  hotplug,
+		CSIImages: syncer.NodePluginImages{
+			Node:      csiNodeImage,
+			Registrar: csiRegistrarImage,
+		},
 	}).SetupWithManager(mgr); err != nil {
 		setupLog.Error(err, "unable to create controller", "controller", "TenantCluster")
 		os.Exit(1)

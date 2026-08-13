@@ -10,6 +10,7 @@ env:
   UPSTREAM_IMAGE: quay.io/kubevirt/kubevirt-cloud-controller-manager
   MIRROR_IMAGE: ghcr.io/the-it-dept/kubevirt-cloud-controller-manager
   SYNCER_IMAGE: ghcr.io/the-it-dept/vcluster-private-cloud-controller
+  CSI_NODE_IMAGE: ghcr.io/the-it-dept/vcluster-private-cloud-controller-csi-node
   CCM_CHART_DIR: charts/vcluster-private-cloud-controller
   SYNCER_CHART_DIR: charts/tenant-syncer
 
@@ -73,6 +74,27 @@ jobs:
           push: true
           tags: ${{ steps.meta.outputs.tags }}
           labels: ${{ steps.meta.outputs.labels }}
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
+      # The CSI node plugin image: same source, `csi-node` target (Alpine with
+      # filesystem tools). Published alongside the controller with matching
+      # tags so one version string pins both halves of the split driver.
+      - id: meta-csi
+        uses: docker/metadata-action@v5
+        with:
+          images: ${{ env.CSI_NODE_IMAGE }}
+          tags: |
+            type=sha,prefix=sha-
+            type=ref,event=tag
+            type=raw,value=latest,enable={{is_default_branch}}
+      - uses: docker/build-push-action@v6
+        with:
+          context: .
+          target: csi-node
+          platforms: linux/amd64
+          push: true
+          tags: ${{ steps.meta-csi.outputs.tags }}
+          labels: ${{ steps.meta-csi.outputs.labels }}
           cache-from: type=gha
           cache-to: type=gha,mode=max
 

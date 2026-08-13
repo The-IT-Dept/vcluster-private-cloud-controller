@@ -5,17 +5,20 @@ apiVersion: v2
 # repository stays in one place.
 name: vcluster-private-cloud-controller
 description: >-
-  The tenant syncer: LoadBalancer Services, Ingress and Gateway API for
-  private-nodes vCluster guest clusters, materialised entirely on the host
-  cluster. One controller on the host watches each registered guest through a
+  The tenant syncer: LoadBalancer Services, Ingress, Gateway API and storage
+  for private-nodes vCluster guest clusters, materialised on the host cluster.
+  One controller on the host watches each registered guest through a
   kubeconfig held host-side, creates host equivalents in the tenant's host
   namespace, validates every hostname against the tenant's allowed domains,
-  and writes addresses back into the guest. Nothing is installed inside any
-  guest, and no guest ever holds a credential to the host.
+  and writes addresses back into the guest. Guest PVCs become host volumes
+  hotplugged into the VM backing whichever node the consuming pod runs on,
+  moving with the workload. The only thing installed inside a guest is the
+  credential-less CSI node plugin; no guest ever holds a credential to the
+  host.
 type: application
-version: 1.0.1
+version: 1.1.0
 # appVersion is the controller image tag this chart is validated against.
-appVersion: v1.0.1
+appVersion: v1.1.0
 home: https://github.com/the-it-dept/vcluster-private-cloud-controller
 sources:
   - https://github.com/the-it-dept/vcluster-private-cloud-controller

@@ -3,3 +3,8 @@ image:
 pollInterval: 20s
 leaderElection: true
 replicas: 2
+csiNode:
+  image:
+    repository: ghcr.io/the-it-dept/vcluster-private-cloud-controller-csi-node
+    tag: csi-test-tag
+  registrarImage: registry.k8s.io/sig-storage/csi-node-driver-registrar:v2.13.0

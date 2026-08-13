@@ -151,6 +151,17 @@ spec:
                     type: string
                   services:
                     type: boolean
+                  storage:
+                    description: |-
+                      Storage enables the storage syncer: host StorageClasses labelled
+                      tenant-offerable are mirrored into the guest, guest PVCs on those classes
+                      become host PVCs hotplugged into the VM backing whichever guest node the
+                      consuming pod runs on, and a CSI node plugin DaemonSet is installed in
+                      the guest so kubelet can mount the device. Enabled by default like the
+                      other syncers, but INERT until the operator labels at least one host
+                      StorageClass tenant-offerable — so enabling the syncer never installs
+                      anything into a guest by itself.
+                    type: boolean
                 type: object
             required:
             - hostNamespace
@@ -238,6 +249,8 @@ spec:
                   httpRoutes:
                     type: integer
                   ingresses:
+                    type: integer
+                  persistentVolumeClaims:
                     type: integer
                   services:
                     type: integer

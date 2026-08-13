@@ -7,7 +7,7 @@ This repository ships two things, versioned apart:
 
 | series | what it is | status |
 |---|---|---|
-| **1.x — the tenant syncer** | Our own host-side controller: LoadBalancer Services, **Ingress**, and **Gateway API** for guest clusters, with per-tenant hostname authority. | current |
+| **1.x — the tenant syncer** | Our own host-side controller: LoadBalancer Services, **Ingress**, **Gateway API** and (1.1+) **storage** for guest clusters, with per-tenant hostname authority. | current |
 | **0.x — upstream CCM wrapper** | A Helm chart deploying the upstream `kubevirt-cloud-controller-manager`, one per guest, LoadBalancer only. | **deprecated** — kept until every deployment has moved to 1.x |
 
 Both are published as OCI charts under the same name
@@ -24,9 +24,11 @@ major version you want.
 never reach the host.**
 
 The syncer runs on the **host**, in the provider's namespace, and holds one
-kubeconfig **per guest** — a credential INTO each guest. Nothing is installed
-inside any guest. No host kubeconfig, no host token, no host service account
-ever exists in a guest.
+kubeconfig **per guest** — a credential INTO each guest. No host kubeconfig,
+no host token, no host service account ever exists in a guest. The one
+component that runs inside a guest (the storage node plugin, below) holds **no
+credential of any kind** — it talks only to the local kubelet and local block
+devices, and a unit test pins that property.
 
 This is not a preference. A customer has **cluster-admin on their own
 cluster** by design, so any credential placed in a guest is a credential the
@@ -111,6 +113,7 @@ spec:
     services: true
     ingresses: true
     gateways: true
+    storage: true   # inert until a host StorageClass is labelled tenant-offerable
     # Optional: only sync guest LB Services with this loadBalancerClass.
     # Lets the syncer coexist with another LB implementation (e.g. the 0.x
     # CCM) serving the same guest during a migration.
@@ -134,6 +137,56 @@ hostname and the allowed domains.
 Refused as a matter of policy, not just non-matching: rules with **no** host,
 `defaultBackend`, and listeners with no hostname — each would capture traffic
 for every hostname the host serves, which per-domain grants cannot authorize.
+
+### Storage (1.1+): volumes that move with the workload
+
+A guest PVC becomes a real host volume attached to whichever VM backs the
+guest node the consuming pod runs on — and it **moves** when the pod is
+rescheduled to another node. A `local` PV cannot do that (its node affinity is
+part of the object), so this is a **CSI driver split across the trust
+boundary**:
+
+| half | runs | does | host credentials |
+|---|---|---|---|
+| controller (provisioner + attacher roles) | **host**, inside the syncer | guest PVC → host PVC; guest VolumeAttachment → KubeVirt hotplug into that node's VM; VA deleted → unplug | the provider's own |
+| node plugin + node-driver-registrar | **guest**, a DaemonSet the syncer installs | find the hotplugged disk by serial, format on first use, mount | **none** |
+
+How to offer storage: label a host StorageClass
+`vcluster.the-it-dept.io/tenant-offerable: "true"`. The syncer mirrors it into
+every storage-enabled guest under the same name — provisioner replaced with
+`csi.vcluster.the-it-dept.io` and **`volumeBindingMode:
+WaitForFirstConsumer`** always, because binding is what tells us which node
+(and therefore which VM) the volume belongs on. The mirror is re-asserted
+every pass; tenant edits to it do not stick.
+
+The flow, end to end: pod scheduled → guest scheduler annotates the PVC with
+its node → syncer creates a **Block-mode host PVC** on the real host class and
+a guest CSI PV (no node affinity — that absence is the mobility) → the guest's
+attach/detach controller creates a VolumeAttachment → syncer hotplugs the host
+PVC into that node's VM as a SCSI disk with a deterministic serial → node
+plugin finds `/dev/disk/by-id/*<serial>*`, formats ext4 on first use, mounts.
+On reschedule the VA for the old node is deleted (syncer unplugs, then
+releases it — the A/D controller's multi-attach guard holds the new node's
+attach until then) and a VA for the new node appears (syncer hotplugs there).
+Same disk, same data, different VM.
+
+Deletion is ordered, and the order is the point: unplug from the VM **first**,
+then delete the host PVC, then the guest PV, then release the guest PVC's
+finalizer. Deleting a host PVC still attached to a running VM leaves a volume
+the host CSI cannot reclaim. Attach state is read live from VMI status every
+pass — never cached — before any PVC deletion.
+
+Storage limits, stated plainly:
+
+- **ReadWriteOnce only.** The volume is one block device in one VM at a time.
+  It moves with the workload; it cannot be shared across nodes. (RWX needs a
+  network filesystem class, which this is not.)
+- **A move is a hotplug cycle**, detach + attach, driven by the poll interval:
+  expect tens of seconds, not milliseconds — same class of delay as any
+  attach/detach storage.
+- Guest `volumeMode: Block` PVCs and volume expansion are not supported yet;
+  refusals are surfaced on the PVC, never silent.
+- The guest node's VM must carry the node's name (the platform's convention).
 
 ### Lifecycle and ownership
 

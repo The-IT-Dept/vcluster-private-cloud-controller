@@ -38,6 +38,14 @@ type pass struct {
 
 	gatewayAPIOnHost bool
 
+	// Storage collaborators, injected from the reconciler: the KubeVirt
+	// hotplug surface and the images for the guest node plugin.
+	hot    Hotplugger
+	images NodePluginImages
+	// storage is the storage slice's working state for this pass; nil when
+	// storage sync is off or its gather failed.
+	storage *storageState
+
 	// Desired host objects, keyed by host object name.
 	services  map[string]*corev1.Service
 	ingresses map[string]*netv1.Ingress
@@ -105,10 +113,11 @@ var (
 	routeGVK   = gwv1.SchemeGroupVersion.WithKind("HTTPRoute")
 )
 
-func newPass(tc *v1alpha1.TenantCluster, host client.Client, hostReader client.Reader, guest client.Client, gatewayAPIOnHost bool, log logr.Logger) *pass {
+func newPass(tc *v1alpha1.TenantCluster, host client.Client, hostReader client.Reader, guest client.Client, gatewayAPIOnHost bool, hot Hotplugger, images NodePluginImages, log logr.Logger) *pass {
 	return &pass{
 		tc: tc, host: host, hostReader: hostReader, guest: guest, log: log,
 		gatewayAPIOnHost: gatewayAPIOnHost,
+		hot:              hot, images: images,
 		services:         map[string]*corev1.Service{},
 		ingresses:        map[string]*netv1.Ingress{},
 		gateways:         map[string]*gwv1.Gateway{},
@@ -139,6 +148,9 @@ func (p *pass) run(ctx context.Context) error {
 			return fmt.Errorf("listing guest gateway resources: %w", err)
 		}
 	}
+	if err := p.gatherStorage(ctx); err != nil {
+		return fmt.Errorf("listing guest storage resources: %w", err)
+	}
 
 	// Finalizers go on BEFORE host objects are created, so there is no window
 	// in which a guest resource with host-side state can vanish uncleanly.
@@ -149,10 +161,16 @@ func (p *pass) run(ctx context.Context) error {
 	// not a reason to skip pruning (which finds nothing in a missing namespace).
 	if p.ensureHostNamespace(ctx) {
 		p.applyAll(ctx)
+		p.applyStorage(ctx)
 	}
 	p.pruneAll(ctx)
+	// Storage prune runs BEFORE finalizer release: teardownGuestPVC re-pins
+	// (wantFinalizer) every deleting PVC whose host state is not yet fully
+	// gone, and that must be decided before releaseGuestFinalizers looks.
+	p.pruneStorage(ctx)
 	p.releaseGuestFinalizers(ctx)
 	p.writeBack(ctx)
+	p.writeBackStorage(ctx)
 	return nil
 }
 

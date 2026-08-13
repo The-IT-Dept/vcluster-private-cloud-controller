@@ -516,3 +516,20 @@ func TestTenantClusterTeardownUnplugsAndDeletesStorage(t *testing.T) {
 		t.Errorf("mirrored guest StorageClass should be deleted, err=%v", err)
 	}
 }
+
+func TestDeletingAttachmentWithMissingPVIsReleased(t *testing.T) {
+	// The zombie the live TenantCluster-teardown test produced: a VA pinned by
+	// our finalizer whose PV has already been cleaned up. It must be released,
+	// not held forever — the guest A/D controller stalls on it otherwise.
+	va := attachment("va-orphan", "pvc-gone", "node-a")
+	va.Finalizers = []string{GuestFinalizer}
+	f := newFixture(t, false, []client.Object{va}, []client.Object{offerableHostSC("fast")})
+	if err := f.guest.Delete(context.Background(), va); err != nil {
+		t.Fatal(err)
+	}
+	f.reconcile(t)
+	var got storagev1.VolumeAttachment
+	if err := f.guest.Get(context.Background(), client.ObjectKey{Name: "va-orphan"}, &got); !apierrors.IsNotFound(err) {
+		t.Fatalf("orphaned deleting VA must be released, err=%v finalizers=%v", err, got.Finalizers)
+	}
+}

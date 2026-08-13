@@ -278,7 +278,23 @@ func (p *pass) reconcileAttachment(ctx context.Context, va *storagev1.VolumeAtta
 	}
 	pv, ok := st.guestPVs[*va.Spec.Source.PersistentVolumeName]
 	if !ok || pv.Spec.CSI == nil {
-		return // not a volume this syncer created
+		// Not a volume this pass can name. But a DELETING VA carrying our
+		// finalizer whose PV is already gone must still be RELEASED: our PVs
+		// are only ever deleted after the unplug paths ran (PVC teardown) or
+		// during TenantCluster teardown (whose host-side sweep unplugs every
+		// labelled PVC independently), so the finalizer is holding nothing —
+		// and without this, the VA is stuck forever and the guest's
+		// attach/detach controller stalls on the volume. Found live: the
+		// teardown-with-attached-volume test left exactly this zombie.
+		if !va.DeletionTimestamp.IsZero() && controllerutil.ContainsFinalizer(va, GuestFinalizer) {
+			if controllerutil.RemoveFinalizer(va, GuestFinalizer) {
+				if err := p.guest.Update(ctx, va); err != nil {
+					p.problems = append(p.problems, fmt.Sprintf(
+						"releasing orphaned guest VolumeAttachment %s: %v", va.Name, err))
+				}
+			}
+		}
+		return
 	}
 	hostPVC := pv.Spec.CSI.VolumeHandle
 	volName := VolumeName(hostPVC)

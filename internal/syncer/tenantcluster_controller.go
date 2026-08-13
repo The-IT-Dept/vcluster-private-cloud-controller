@@ -100,8 +100,15 @@ type cachedGuest struct {
 func (r *TenantClusterReconciler) Reconcile(ctx context.Context, req ctrl.Request) (ctrl.Result, error) {
 	log := logf.FromContext(ctx)
 
+	// The TenantCluster is read UNCACHED, and that matters twice over. A stale
+	// cache event can deliver (a) a deleted TenantCluster after a same-name
+	// replacement was created — ownership labels carry name and namespace, not
+	// UID, so a teardown driven by the stale copy would delete the
+	// REPLACEMENT's host objects; or (b) a pre-deletion copy of a TenantCluster
+	// that is already gone, which would recreate host objects nothing will ever
+	// clean up. One uncached GET per pass buys out both races.
 	var tc v1alpha1.TenantCluster
-	if err := r.Get(ctx, req.NamespacedName, &tc); err != nil {
+	if err := r.Reader.Get(ctx, req.NamespacedName, &tc); err != nil {
 		return ctrl.Result{}, client.IgnoreNotFound(err)
 	}
 	if !tc.DeletionTimestamp.IsZero() {

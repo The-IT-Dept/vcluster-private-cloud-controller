@@ -13,9 +13,9 @@ description: >-
   and writes addresses back into the guest. Nothing is installed inside any
   guest, and no guest ever holds a credential to the host.
 type: application
-version: 1.0.0
+version: 1.0.1
 # appVersion is the controller image tag this chart is validated against.
-appVersion: v1.0.0
+appVersion: v1.0.1
 home: https://github.com/the-it-dept/vcluster-private-cloud-controller
 sources:
   - https://github.com/the-it-dept/vcluster-private-cloud-controller

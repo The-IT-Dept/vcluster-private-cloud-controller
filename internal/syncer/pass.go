@@ -10,6 +10,7 @@ import (
 	corev1 "k8s.io/api/core/v1"
 	netv1 "k8s.io/api/networking/v1"
 	apierrors "k8s.io/apimachinery/pkg/api/errors"
+	"k8s.io/apimachinery/pkg/api/equality"
 	"k8s.io/apimachinery/pkg/api/meta"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/runtime/schema"
@@ -148,6 +149,10 @@ func (p *pass) run(ctx context.Context) error {
 			return fmt.Errorf("listing guest gateway resources: %w", err)
 		}
 	}
+	// The guest GatewayClass is advertised BEFORE the rest of the pass so a
+	// tenant with no Gateways yet still has something to name; it is what makes
+	// the first Gateway writable at all.
+	p.reconcileGuestGatewayClass(ctx)
 	if err := p.gatherStorage(ctx); err != nil {
 		return fmt.Errorf("listing guest storage resources: %w", err)
 	}
@@ -297,6 +302,90 @@ func (p *pass) gatherGateways(ctx context.Context) error {
 		p.addBackends(rt.Namespace, res.backends)
 	}
 	return nil
+}
+
+// reconcileGuestGatewayClass mirrors the one GatewayClass a tenant may name
+// into the guest, and removes any class it previously mirrored that is no
+// longer offered. A tenant has no access to the host, so without this the
+// class name is a string they would have to guess — see mirrorGatewayClass.
+//
+// Every failure here is a p.problems entry, never a returned error: the guest
+// not having the Gateway API, or a tenant having deleted the class, must not
+// fail a pass that is also carrying Services and storage.
+func (p *pass) reconcileGuestGatewayClass(ctx context.Context) {
+	var have gwv1.GatewayClassList
+	switch err := p.guest.List(ctx, &have, client.MatchingLabels{ManagedByLabel: ManagedByValue}); {
+	case meta.IsNoMatchError(err):
+		return // guest has no Gateway API CRDs; nothing to advertise into
+	case err != nil:
+		p.problems = append(p.problems, fmt.Sprintf("listing guest GatewayClasses: %v", err))
+		return
+	}
+
+	wanted := ""
+	if p.tc.SyncGateways() && p.gatewayAPIOnHost && p.tc.Spec.GatewayClassName != "" {
+		wanted = p.tc.Spec.GatewayClassName
+	}
+
+	for i := range have.Items {
+		gc := &have.Items[i]
+		if gc.Name == wanted {
+			continue
+		}
+		// Renamed, or gateway sync turned off: a class we advertised and no
+		// longer honour must not stay on offer.
+		if err := p.guest.Delete(ctx, gc); err != nil && !apierrors.IsNotFound(err) {
+			p.problems = append(p.problems, fmt.Sprintf("deleting guest GatewayClass %q: %v", gc.Name, err))
+		}
+	}
+	if wanted == "" {
+		return
+	}
+
+	want := mirrorGatewayClass(p.tc)
+	var existing gwv1.GatewayClass
+	err := p.guest.Get(ctx, client.ObjectKey{Name: wanted}, &existing)
+	switch {
+	case apierrors.IsNotFound(err):
+		if err := p.guest.Create(ctx, want); err != nil && !apierrors.IsAlreadyExists(err) {
+			p.problems = append(p.problems, fmt.Sprintf("creating guest GatewayClass %q: %v", wanted, err))
+			return
+		}
+		existing = *want
+	case err != nil:
+		p.problems = append(p.problems, fmt.Sprintf("reading guest GatewayClass %q: %v", wanted, err))
+		return
+	default:
+		// controllerName is immutable, so a class the tenant recreated pointing
+		// at some other controller has to be replaced rather than updated.
+		if existing.Spec.ControllerName != want.Spec.ControllerName {
+			if err := p.guest.Delete(ctx, &existing); err != nil && !apierrors.IsNotFound(err) {
+				p.problems = append(p.problems, fmt.Sprintf("replacing guest GatewayClass %q: %v", wanted, err))
+				return
+			}
+			if err := p.guest.Create(ctx, want); err != nil {
+				p.problems = append(p.problems, fmt.Sprintf("recreating guest GatewayClass %q: %v", wanted, err))
+				return
+			}
+			existing = *want
+		} else if !equality.Semantic.DeepEqual(existing.Spec.Description, want.Spec.Description) ||
+			existing.Labels[ManagedByLabel] != ManagedByValue {
+			existing.Spec.Description = want.Spec.Description
+			existing.Labels = mergeLabels(existing.Labels, want.Labels)
+			if err := p.guest.Update(ctx, &existing); err != nil {
+				p.problems = append(p.problems, fmt.Sprintf("updating guest GatewayClass %q: %v", wanted, err))
+				return
+			}
+		}
+	}
+
+	// Nothing else in the guest would ever set Accepted, and a class stuck at
+	// Unknown reads as broken to every tool that looks at it.
+	if meta.SetStatusCondition(&existing.Status.Conditions, gatewayClassAcceptedCondition(existing.Generation)) {
+		if err := p.guest.Status().Update(ctx, &existing); err != nil {
+			p.problems = append(p.problems, fmt.Sprintf("marking guest GatewayClass %q accepted: %v", wanted, err))
+		}
+	}
 }
 
 // backendResolver answers "can the host reach guest Service <name> in <ns>?"

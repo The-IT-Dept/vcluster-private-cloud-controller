@@ -294,6 +294,7 @@ func (r *TenantClusterReconciler) reconcileDelete(ctx context.Context, tc *v1alp
 	if guest, err := r.guestClientFor(ctx, tc); err == nil {
 		r.stripGuestFinalizers(ctx, guest)
 		r.cleanupGuestStorage(ctx, guest)
+		r.cleanupGuestGatewayClasses(ctx, guest)
 	}
 
 	r.mu.Lock()
@@ -307,6 +308,20 @@ func (r *TenantClusterReconciler) reconcileDelete(ctx context.Context, tc *v1alp
 	}
 	log.Info("tenant cluster released", "tenantcluster", tc.Name)
 	return ctrl.Result{}, nil
+}
+
+// cleanupGuestGatewayClasses removes the GatewayClass this syncer mirrored
+// into a guest. Best-effort like every other guest-side teardown step: an
+// unreachable guest must not hold up host-side cleanup, and the object is
+// inert once the syncer stops serving it.
+func (r *TenantClusterReconciler) cleanupGuestGatewayClasses(ctx context.Context, guest client.Client) {
+	var list gwv1.GatewayClassList
+	if err := guest.List(ctx, &list, client.MatchingLabels{ManagedByLabel: ManagedByValue}); err != nil {
+		return
+	}
+	for i := range list.Items {
+		_ = guest.Delete(ctx, &list.Items[i])
+	}
 }
 
 func (r *TenantClusterReconciler) stripGuestFinalizers(ctx context.Context, guest client.Client) {

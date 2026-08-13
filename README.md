@@ -138,6 +138,36 @@ Refused as a matter of policy, not just non-matching: rules with **no** host,
 `defaultBackend`, and listeners with no hostname — each would capture traffic
 for every hostname the host serves, which per-domain grants cannot authorize.
 
+An HTTPRoute with **no** hostnames is deliberately *not* refused, and the
+distinction matters. Gateway API confines such a route to the hostnames of the
+listeners it attaches to, and every listener hostname has already been through
+the authority above — so it can only ever be published on names the tenant was
+granted. Refusing it would break the ordinary case of a route inheriting its
+Gateway's hostname. The invariant this rests on is the listener check, which is
+exactly why a hostname-less *listener* is refused outright.
+
+Object references inside HTTPRoute filters are rewritten or refused, never
+copied: a `RequestMirror` backendRef is a Service reference like any other and
+would otherwise resolve host-side against whatever bears that name, and an
+`ExtensionRef` names a host CRD the tenant has no business reaching.
+Cross-namespace backendRefs are refused rather than silently flattened into the
+route's own namespace.
+
+### Gateway API needs a GatewayClass in the guest
+
+Every `Gateway` must name a `GatewayClass`, and `gatewayClassName` is the
+operator's choice on the `TenantCluster` — which lives on the host, where a
+tenant cannot look. So the syncer **mirrors it into the guest**, the same way
+and for the same reason it mirrors offerable StorageClasses; without it a
+tenant is guessing a string, and a Gateway naming the wrong one is simply never
+served. The mirrored class keeps the host class's *name* (the pass maps it back
+by name) but names **this syncer** as its controller rather than the host's —
+inside the guest, the syncer is what implements it, and claiming otherwise
+would invite a guest-side installation of that controller to fight for it. It
+is marked `Accepted` because nothing else in the guest ever would, withdrawn if
+the operator renames the class or turns Gateway sync off, and removed on
+`TenantCluster` teardown.
+
 ### Storage (1.1+): volumes that move with the workload
 
 A guest PVC becomes a real host volume attached to whichever VM backs the

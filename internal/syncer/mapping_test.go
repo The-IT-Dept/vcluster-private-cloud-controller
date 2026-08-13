@@ -250,3 +250,118 @@ func ingressRule(host, backend string) netv1.IngressRule {
 		}},
 	}
 }
+
+func TestMapGatewayRefusesWhenNoGatewayClassConfigured(t *testing.T) {
+	// An unset gatewayClassName previously stamped "" onto the host Gateway,
+	// which the API server rejects once per pass with the reason visible only
+	// to the operator. The tenant is owed it on their own object.
+	tc := testTC()
+	tc.Spec.GatewayClassName = ""
+	good := gwv1.Hostname("x.apps.example.com")
+	gw := &gwv1.Gateway{
+		ObjectMeta: metav1.ObjectMeta{Name: "gw", Namespace: "default", UID: "gw-uid"},
+		Spec: gwv1.GatewaySpec{Listeners: []gwv1.Listener{
+			{Name: "ok", Hostname: &good, Port: 80, Protocol: gwv1.HTTPProtocolType},
+		}},
+	}
+	host, refusals := mapGateway(tc, gw)
+	if host != nil {
+		t.Fatalf("no host Gateway may be built without a class, got %+v", host)
+	}
+	if len(refusals) != 1 || !strings.Contains(refusals[0], "gatewayClassName") {
+		t.Errorf("the refusal must name the missing setting, got %v", refusals)
+	}
+}
+
+func TestMirrorGatewayClassNamesOurOwnController(t *testing.T) {
+	gc := mirrorGatewayClass(testTC())
+	if gc.Name != "host-gw" {
+		t.Errorf("the guest class must carry the host name the tenant has to write, got %q", gc.Name)
+	}
+	// Naming the HOST's controller in the guest would be untrue — there is no
+	// such controller there — and would invite one to fight us for the class.
+	if gc.Spec.ControllerName != GuestGatewayControllerName {
+		t.Errorf("guest class must name the syncer, got %q", gc.Spec.ControllerName)
+	}
+	if gc.Labels[ManagedByLabel] != ManagedByValue {
+		t.Errorf("the mirror must be identifiable for prune, got %v", gc.Labels)
+	}
+	if gc.Spec.Description == nil || !strings.Contains(*gc.Spec.Description, "app.example.com") {
+		t.Errorf("the description should tell the tenant which hostnames are allowed, got %v", gc.Spec.Description)
+	}
+}
+
+// routeWithFilters builds a route whose only backend is "echo", carrying the
+// given filters at the rule level.
+func routeWithFilters(filters []gwv1.HTTPRouteFilter) *gwv1.HTTPRoute {
+	host := gwv1.Hostname("app.example.com")
+	return &gwv1.HTTPRoute{
+		ObjectMeta: metav1.ObjectMeta{Name: "rt", Namespace: "default", UID: "rt-uid"},
+		Spec: gwv1.HTTPRouteSpec{
+			CommonRouteSpec: gwv1.CommonRouteSpec{ParentRefs: []gwv1.ParentReference{{Name: "gw"}}},
+			Hostnames:       []gwv1.Hostname{host},
+			Rules: []gwv1.HTTPRouteRule{{
+				Filters:     filters,
+				BackendRefs: []gwv1.HTTPBackendRef{{BackendRef: gwv1.BackendRef{BackendObjectReference: gwv1.BackendObjectReference{Name: "echo"}}}},
+			}},
+		},
+	}
+}
+
+func okResolver(string) string { return "" }
+
+func TestMapHTTPRouteRewritesRequestMirrorBackend(t *testing.T) {
+	// A RequestMirror backendRef is a Service reference like any other. Left
+	// unrewritten it resolves on the HOST against whatever bears that name.
+	f := []gwv1.HTTPRouteFilter{{
+		Type: gwv1.HTTPRouteFilterRequestMirror,
+		RequestMirror: &gwv1.HTTPRequestMirrorFilter{
+			BackendRef: gwv1.BackendObjectReference{Name: "echo"},
+		},
+	}}
+	res := mapHTTPRoute(testTC(), routeWithFilters(f), okResolver)
+	if res.host == nil {
+		t.Fatalf("route must sync, refusals: %v", res.refusals)
+	}
+	got := res.host.Spec.Rules[0].Filters[0].RequestMirror.BackendRef.Name
+	want := gwv1.ObjectName(HostObjectName("pn1", "default", "echo"))
+	if got != want {
+		t.Errorf("mirror backend must be rewritten to the host name: got %q want %q", got, want)
+	}
+	// And the host Service for it has to be materialised, or the mirror
+	// silently points at nothing.
+	if len(res.backends) != 1 || res.backends[0] != "echo" {
+		t.Errorf("the mirror backend must be pulled into the backend set, got %v", res.backends)
+	}
+}
+
+func TestMapHTTPRouteRefusesExtensionRefFilter(t *testing.T) {
+	// ExtensionRef names an implementation-specific CRD in the HOST namespace.
+	f := []gwv1.HTTPRouteFilter{{
+		Type:         gwv1.HTTPRouteFilterExtensionRef,
+		ExtensionRef: &gwv1.LocalObjectReference{Group: "cilium.io", Kind: "CiliumEnvoyConfig", Name: "sneaky"},
+	}}
+	res := mapHTTPRoute(testTC(), routeWithFilters(f), okResolver)
+	if res.host != nil && len(res.host.Spec.Rules[0].Filters) != 0 {
+		t.Errorf("an ExtensionRef filter must never reach the host, got %+v", res.host.Spec.Rules[0].Filters)
+	}
+	if len(res.refusals) != 1 || !strings.Contains(res.refusals[0], "ExtensionRef") {
+		t.Errorf("the refusal must name the filter, got %v", res.refusals)
+	}
+}
+
+func TestMapHTTPRouteRefusesCrossNamespaceBackend(t *testing.T) {
+	// The resolver only ever looks in the route's own namespace, so silently
+	// dropping the namespace would send traffic to a same-named Service in the
+	// WRONG one.
+	other := gwv1.Namespace("kube-system")
+	rt := routeWithFilters(nil)
+	rt.Spec.Rules[0].BackendRefs[0].Namespace = &other
+	res := mapHTTPRoute(testTC(), rt, okResolver)
+	if res.host != nil {
+		t.Errorf("no host route should survive its only backend being refused, got %+v", res.host)
+	}
+	if len(res.refusals) != 1 || !strings.Contains(res.refusals[0], "cross-namespace") {
+		t.Errorf("the refusal must say why, got %v", res.refusals)
+	}
+}

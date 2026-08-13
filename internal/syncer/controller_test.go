@@ -100,7 +100,7 @@ func newFixture(t *testing.T, hostGateway bool, guestObjs []client.Object, hostO
 		Build()
 	guest := fake.NewClientBuilder().WithScheme(guestScheme).
 		WithObjects(guestObjs...).
-		WithStatusSubresource(&corev1.Service{}, &netv1.Ingress{}, &gwv1.Gateway{}, &storagev1.VolumeAttachment{}).
+		WithStatusSubresource(&corev1.Service{}, &netv1.Ingress{}, &gwv1.Gateway{}, &gwv1.GatewayClass{}, &storagev1.VolumeAttachment{}).
 		Build()
 
 	hot := newFakeHotplug("node-a")
@@ -461,4 +461,71 @@ func hasFinalizer(obj client.Object, f string) bool {
 		}
 	}
 	return false
+}
+
+// TestGuestGatewayClassIsMirrored is the answer to "can a tenant create a
+// usable Gateway at all". Every Gateway must name a GatewayClass; the class
+// name is the operator's choice on the TenantCluster, which lives on the host
+// where the tenant cannot look. Without a mirror they are guessing a string.
+func TestGuestGatewayClassIsMirrored(t *testing.T) {
+	f := newFixture(t, true, nil, nil)
+	ctx := context.Background()
+
+	// Off by default: no gatewayClassName means nothing is advertised, exactly
+	// as an unlabelled StorageClass means no storage is offered.
+	f.reconcile(t)
+	var none gwv1.GatewayClassList
+	if err := f.guest.List(ctx, &none); err != nil {
+		t.Fatal(err)
+	}
+	if len(none.Items) != 0 {
+		t.Fatalf("no class may be advertised before the operator names one, got %d", len(none.Items))
+	}
+
+	tc := f.getTC(t)
+	tc.Spec.GatewayClassName = "host-gw"
+	if err := f.host.Update(ctx, tc); err != nil {
+		t.Fatal(err)
+	}
+	f.reconcile(t)
+
+	var gc gwv1.GatewayClass
+	if err := f.guest.Get(ctx, types.NamespacedName{Name: "host-gw"}, &gc); err != nil {
+		t.Fatalf("the guest must be told which class to name: %v", err)
+	}
+	if gc.Spec.ControllerName != GuestGatewayControllerName {
+		t.Errorf("guest class must name the syncer, got %q", gc.Spec.ControllerName)
+	}
+	if c := meta.FindStatusCondition(gc.Status.Conditions, "Accepted"); c == nil || c.Status != metav1.ConditionTrue {
+		t.Errorf("nothing else in the guest sets Accepted, so the syncer must: %+v", c)
+	}
+
+	// Renaming the class must withdraw the old one rather than leave two on
+	// offer, only one of which the syncer honours.
+	tc = f.getTC(t)
+	tc.Spec.GatewayClassName = "host-gw-2"
+	if err := f.host.Update(ctx, tc); err != nil {
+		t.Fatal(err)
+	}
+	f.reconcile(t)
+
+	if err := f.guest.Get(ctx, types.NamespacedName{Name: "host-gw"}, &gc); !apierrors.IsNotFound(err) {
+		t.Errorf("the withdrawn class must be deleted, got %v", err)
+	}
+	if err := f.guest.Get(ctx, types.NamespacedName{Name: "host-gw-2"}, &gc); err != nil {
+		t.Errorf("the renamed class must be advertised: %v", err)
+	}
+
+	// And TenantCluster teardown takes it with everything else.
+	if err := f.host.Delete(ctx, f.getTC(t)); err != nil {
+		t.Fatal(err)
+	}
+	f.reconcile(t)
+	var left gwv1.GatewayClassList
+	if err := f.guest.List(ctx, &left); err != nil {
+		t.Fatal(err)
+	}
+	if len(left.Items) != 0 {
+		t.Errorf("teardown must remove the mirrored class, %d left", len(left.Items))
+	}
 }

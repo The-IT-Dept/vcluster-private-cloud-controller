@@ -3,6 +3,7 @@ package syncer
 import (
 	"fmt"
 	"sort"
+	"strings"
 
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	gwv1 "sigs.k8s.io/gateway-api/apis/v1"
@@ -20,12 +21,73 @@ import (
 // on the other syncers. That check lives in the controller (it needs a
 // RESTMapper); this file is only the pure mapping.
 
+// GuestGatewayControllerName is the controller named by the GatewayClass this
+// syncer mirrors INTO a guest. Deliberately not the host's controller name
+// (Cilium's, say): inside the guest the thing that implements this class is
+// the syncer, and naming the host's controller there would both be untrue and
+// invite a guest-side installation of that controller to fight us for it. The
+// same reasoning as mirrorStorageClass replacing the provisioner with our own
+// CSI driver name.
+const GuestGatewayControllerName = "vcluster.the-it-dept.io/tenant-syncer"
+
+// mirrorGatewayClass builds the guest GatewayClass advertising the one class a
+// tenant may name.
+//
+// WITHOUT THIS A TENANT CANNOT CREATE A USABLE GATEWAY AT ALL. Every Gateway
+// must name a GatewayClass, the host's class name is the operator's choice in
+// the TenantCluster, and a tenant has no access to the host to discover it —
+// so they would be guessing a string. StorageClasses are mirrored for exactly
+// this reason and Gateway API needs the same courtesy.
+//
+// It carries the host name unchanged, because the pass maps it back by name.
+func mirrorGatewayClass(tc *v1alpha1.TenantCluster) *gwv1.GatewayClass {
+	desc := fmt.Sprintf("Gateways on this class are published on the host cluster by the tenant syncer. Allowed hostnames: %s.",
+		describeDomains(tc.Spec.AllowedDomains))
+	return &gwv1.GatewayClass{
+		ObjectMeta: metav1.ObjectMeta{
+			Name:   tc.Spec.GatewayClassName,
+			Labels: map[string]string{ManagedByLabel: ManagedByValue},
+		},
+		Spec: gwv1.GatewayClassSpec{
+			ControllerName: GuestGatewayControllerName,
+			Description:    &desc,
+		},
+	}
+}
+
+// gatewayClassAcceptedCondition is set on the mirrored guest class. Nothing in
+// the guest would otherwise set it, and a GatewayClass sitting at ACCEPTED
+// "Unknown" forever reads as broken to every tool that looks.
+func gatewayClassAcceptedCondition(generation int64) metav1.Condition {
+	return metav1.Condition{
+		Type:               string(gwv1.GatewayClassConditionStatusAccepted),
+		Status:             metav1.ConditionTrue,
+		Reason:             string(gwv1.GatewayClassReasonAccepted),
+		Message:            "the host cluster's tenant syncer serves Gateways on this class",
+		ObservedGeneration: generation,
+	}
+}
+
+func describeDomains(domains []string) string {
+	if len(domains) == 0 {
+		return "none configured, so every Gateway hostname will be refused"
+	}
+	return strings.Join(domains, ", ")
+}
+
 // mapGateway translates one guest Gateway. Listeners whose hostname fails
 // validation are dropped with a refusal; a listener with NO hostname is
 // refused too, because it would accept traffic for every name the host serves.
 func mapGateway(tc *v1alpha1.TenantCluster, guest *gwv1.Gateway) (*gwv1.Gateway, []string) {
 	var refusals []string
 	var listeners []gwv1.Listener
+
+	if tc.Spec.GatewayClassName == "" {
+		// Stamping an empty class produces a host Gateway the API server rejects,
+		// once per pass, with the reason visible only to the operator. The tenant
+		// is owed the reason on their own object instead.
+		return nil, []string{"Gateway sync is not configured for this cluster: the operator has set no gatewayClassName on its TenantCluster registration"}
+	}
 
 	for _, l := range guest.Spec.Listeners {
 		if l.Hostname == nil || *l.Hostname == "" {
@@ -121,10 +183,29 @@ func mapHTTPRoute(tc *v1alpha1.TenantCluster, guest *gwv1.HTTPRoute, resolveBack
 	for i, rule := range guest.Spec.Rules {
 		out := *rule.DeepCopy()
 		out.BackendRefs = nil
+
+		// Rule-level filters carry object references of their own, and an
+		// unrewritten one resolves on the HOST against whatever bears that name.
+		filters, fRefs, fRefusals := mapFilters(tc, guest.Namespace, rule.Filters, fmt.Sprintf("rule %d", i), resolveBackend)
+		out.Filters = filters
+		res.refusals = append(res.refusals, fRefusals...)
+		for _, n := range fRefs {
+			backendSet[n] = true
+		}
+
 		for _, b := range rule.BackendRefs {
 			if b.Kind != nil && *b.Kind != "Service" {
 				res.refusals = append(res.refusals, fmt.Sprintf(
 					"rule %d: backendRef %q refused: only Service backends can be carried to the host", i, b.Name))
+				continue
+			}
+			// A cross-namespace backendRef must be refused, not silently
+			// flattened: the resolver only ever looks in the route's own
+			// namespace, so dropping the namespace would quietly send traffic to a
+			// same-named Service in the WRONG namespace.
+			if b.Namespace != nil && string(*b.Namespace) != guest.Namespace {
+				res.refusals = append(res.refusals, fmt.Sprintf(
+					"rule %d: backendRef %q refused: cross-namespace backends are not carried to the host", i, b.Name))
 				continue
 			}
 			if msg := resolveBackend(string(b.Name)); msg != "" {
@@ -135,6 +216,14 @@ func mapHTTPRoute(tc *v1alpha1.TenantCluster, guest *gwv1.HTTPRoute, resolveBack
 			ob := *b.DeepCopy()
 			ob.Name = gwv1.ObjectName(HostObjectName(tc.Name, guest.Namespace, string(b.Name)))
 			ob.Namespace = nil
+			// Per-backendRef filters are references too, and are missed by any
+			// check that only walks the rule level.
+			bFilters, bRefs, bRefusals := mapFilters(tc, guest.Namespace, b.Filters, fmt.Sprintf("rule %d backendRef %q", i, b.Name), resolveBackend)
+			ob.Filters = bFilters
+			res.refusals = append(res.refusals, bRefusals...)
+			for _, n := range bRefs {
+				backendSet[n] = true
+			}
 			out.BackendRefs = append(out.BackendRefs, ob)
 			backendSet[string(b.Name)] = true
 		}
@@ -163,4 +252,65 @@ func mapHTTPRoute(tc *v1alpha1.TenantCluster, guest *gwv1.HTTPRoute, resolveBack
 	}
 	sort.Strings(res.backends)
 	return res
+}
+
+// mapFilters rewrites the object references inside HTTPRoute filters, and is
+// the reason this is not simply a DeepCopy of the rule.
+//
+// A filter copied verbatim keeps GUEST object names, which on the host resolve
+// against whatever happens to bear that name in the tenant's host namespace —
+// never the guest object the tenant meant, and never checked by the backend
+// resolver that guards ordinary backendRefs. Returns the mapped filters, the
+// guest Service names they pull in (so host backends get materialised for
+// them), and any refusals.
+func mapFilters(tc *v1alpha1.TenantCluster, guestNS string, filters []gwv1.HTTPRouteFilter, where string, resolveBackend func(string) string) ([]gwv1.HTTPRouteFilter, []string, []string) {
+	var out []gwv1.HTTPRouteFilter
+	var backends, refusals []string
+
+	for _, f := range filters {
+		switch f.Type {
+		case gwv1.HTTPRouteFilterExtensionRef:
+			// ExtensionRef names an implementation-specific CRD in the HOST
+			// namespace. Those extensions are the provider's, and there is no
+			// rewriting that would make one mean what the tenant intended.
+			name := ""
+			if f.ExtensionRef != nil {
+				name = string(f.ExtensionRef.Name)
+			}
+			refusals = append(refusals, fmt.Sprintf(
+				"%s: ExtensionRef filter %q refused: host cluster extensions cannot be referenced from a guest route", where, name))
+
+		case gwv1.HTTPRouteFilterRequestMirror:
+			if f.RequestMirror == nil {
+				continue
+			}
+			b := f.RequestMirror.BackendRef
+			if b.Kind != nil && *b.Kind != "Service" {
+				refusals = append(refusals, fmt.Sprintf(
+					"%s: RequestMirror backendRef %q refused: only Service backends can be carried to the host", where, b.Name))
+				continue
+			}
+			if b.Namespace != nil && string(*b.Namespace) != guestNS {
+				refusals = append(refusals, fmt.Sprintf(
+					"%s: RequestMirror backendRef %q refused: cross-namespace backends are not carried to the host", where, b.Name))
+				continue
+			}
+			if msg := resolveBackend(string(b.Name)); msg != "" {
+				refusals = append(refusals, fmt.Sprintf(
+					"%s: RequestMirror backend service %q: %s", where, b.Name, msg))
+				continue
+			}
+			nf := *f.DeepCopy()
+			nf.RequestMirror.BackendRef.Name = gwv1.ObjectName(HostObjectName(tc.Name, guestNS, string(b.Name)))
+			nf.RequestMirror.BackendRef.Namespace = nil
+			out = append(out, nf)
+			backends = append(backends, string(b.Name))
+
+		default:
+			// Header modifiers, RequestRedirect and URLRewrite carry no object
+			// reference — only literal values — so they cross unchanged.
+			out = append(out, *f.DeepCopy())
+		}
+	}
+	return out, backends, refusals
 }

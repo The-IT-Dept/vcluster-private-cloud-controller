@@ -1,0 +1,102 @@
+# Default values for vcluster-private-cloud-controller.
+#
+# The chart deploys one kubevirt-cloud-controller-manager Deployment per entry
+# in `clusters`. Each instance watches Services of type LoadBalancer in ONE
+# guest cluster (via a kubeconfig Secret) and materialises a matching
+# LoadBalancer Service in the HOST cluster, in the namespace where that
+# guest's KubeVirt VMs live. The host Service selects the virt-launcher pods
+# by label, so it keeps working across VM restarts even though the VM (and
+# therefore the guest node) gets a new IP each time.
+
+image:
+  # Mirror of quay.io/kubevirt/kubevirt-cloud-controller-manager, copied by
+  # this repo's CI so deployments do not depend on quay availability.
+  repository: ghcr.io/the-it-dept/kubevirt-cloud-controller-manager
+  # Defaults to the chart's appVersion when empty.
+  tag: ""
+  pullPolicy: IfNotPresent
+
+imagePullSecrets: []
+
+# One entry per guest cluster.
+clusters: []
+#  - # Name of this guest cluster. Used in resource names and, unless
+#    # clusterName overrides it, as the CCM --cluster-name, which becomes the
+#    # value of the cluster.x-k8s.io/cluster-name label the host Service
+#    # selects VMs by. The guest's VM pods MUST carry:
+#    #   cluster.x-k8s.io/cluster-name: <clusterName>
+#    #   cluster.x-k8s.io/role: worker
+#    # (put them in the VirtualMachine's spec.template.metadata.labels —
+#    # KubeVirt copies them onto every virt-launcher pod it creates).
+#    name: tenant-a
+#    clusterName: ""
+#
+#    # Host-cluster namespace containing this guest's KubeVirt VMs. The
+#    # host-side LoadBalancer Services are created here too.
+#    vmNamespace: tenant-a-vms
+#
+#    # Secret (in the release namespace) holding a kubeconfig for the GUEST
+#    # cluster's API server, reachable from host pods. For a vCluster, point
+#    # the server at the vcluster's in-cluster Service
+#    # (https://<vcluster>.<vcluster-namespace>.svc) rather than a public
+#    # ingress hostname.
+#    kubeconfigSecret:
+#      name: tenant-a-guest-kubeconfig
+#      key: kubeconfig
+#
+#    # Which cloud-controller-manager controllers to run. For vCluster
+#    # private-nodes guests keep this at just `service`: vCluster's embedded
+#    # cloud provider already owns node initialisation and lifecycle (it sets
+#    # providerID vcluster://..., which this CCM could not parse anyway).
+#    controllers:
+#      - service
+#
+#    loadBalancer:
+#      # Seconds between polls while waiting for the host Service to be
+#      # assigned an address, and the overall timeout.
+#      creationPollInterval: 5
+#      creationPollTimeout: 60
+#
+#    # Extra labels stamped on every host-side Service this instance creates,
+#    # merged with the upstream tenant-service/cluster-name labels. Useful for
+#    # garbage collection when a guest cluster is deleted.
+#    infraLabels: {}
+#
+#    # Additional CLI args for kubevirt-cloud-controller-manager.
+#    extraArgs: []
+
+# Applied to every per-cluster Deployment.
+replicas: 1
+
+resources:
+  requests:
+    cpu: 25m
+    memory: 64Mi
+  limits:
+    memory: 256Mi
+
+podLabels: {}
+podAnnotations: {}
+nodeSelector: {}
+tolerations: []
+affinity: {}
+
+podSecurityContext:
+  seccompProfile:
+    type: RuntimeDefault
+
+containerSecurityContext:
+  allowPrivilegeEscalation: false
+  readOnlyRootFilesystem: true
+  capabilities:
+    drop: ["ALL"]
+
+serviceAccount:
+  create: true
+  name: ""
+  annotations: {}
+
+rbac:
+  # Creates a Role (services CRUD) + RoleBinding in every distinct
+  # vmNamespace listed under clusters.
+  create: true

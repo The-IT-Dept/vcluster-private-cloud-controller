@@ -1,0 +1,23 @@
+apiVersion: v2
+name: vcluster-private-cloud-controller
+description: >-
+  LoadBalancer support for private-nodes vCluster guest clusters whose nodes
+  are KubeVirt VMs, backed entirely by the host cluster. Deploys one
+  kubevirt-cloud-controller-manager (the upstream KubeVirt cloud provider)
+  per guest cluster, configured for the vCluster private-nodes topology:
+  LoadBalancer only, node lifecycle left to vCluster's embedded cloud
+  provider.
+type: application
+version: 0.1.0
+# appVersion tracks the upstream kubevirt/cloud-provider-kubevirt release the
+# chart is validated against. The image mirror workflow publishes the same tag.
+appVersion: v0.6.0
+home: https://github.com/the-it-dept/vcluster-private-cloud-controller
+sources:
+  - https://github.com/the-it-dept/vcluster-private-cloud-controller
+  - https://github.com/kubevirt/cloud-provider-kubevirt
+keywords:
+  - kubevirt
+  - vcluster
+  - loadbalancer
+  - cloud-provider

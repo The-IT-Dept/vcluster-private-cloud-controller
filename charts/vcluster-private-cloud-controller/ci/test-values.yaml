@@ -1,0 +1,19 @@
+# Lint/CI values — placeholder names only.
+clusters:
+  - name: tenant-a
+    vmNamespace: tenant-a-vms
+    kubeconfigSecret:
+      name: tenant-a-guest-kubeconfig
+      key: kubeconfig
+  - name: tenant-b
+    clusterName: tenant-b-prod
+    vmNamespace: tenant-b-vms
+    kubeconfigSecret:
+      name: tenant-b-guest-kubeconfig
+    loadBalancer:
+      creationPollInterval: 3
+      creationPollTimeout: 120
+    infraLabels:
+      example.com/tenant: tenant-b
+    extraArgs:
+      - --v=4

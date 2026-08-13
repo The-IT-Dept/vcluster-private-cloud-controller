@@ -1,0 +1,16 @@
+# Credentials — never commit
+*.kubeconfig
+kubeconfig*
+*.pem
+*.key
+.env
+.env.*
+
+# Helm packaging output
+*.tgz
+charts/**/charts/
+
+# Editor / OS noise
+.DS_Store
+.idea/
+.vscode/

@@ -1,0 +1,158 @@
+{{- range $cluster := .Values.clusters }}
+{{- if not $cluster.name }}{{ fail "every entry in .Values.clusters needs a name" }}{{- end }}
+{{- if not $cluster.vmNamespace }}{{ fail (printf "cluster %q needs vmNamespace (host namespace containing its KubeVirt VMs)" $cluster.name) }}{{- end }}
+{{- if not (and $cluster.kubeconfigSecret $cluster.kubeconfigSecret.name) }}{{ fail (printf "cluster %q needs kubeconfigSecret.name (Secret with a guest-cluster kubeconfig)" $cluster.name) }}{{- end }}
+{{- $name := printf "%s-%s" (include "vpcc.fullname" $) $cluster.name | trunc 63 | trimSuffix "-" }}
+{{- $clusterName := include "vpcc.clusterName" (dict "cluster" $cluster) }}
+---
+# cloud-config for the kubevirt cloud provider. `namespace` is where it will
+# create the host-side LoadBalancer Services (and where it would look for
+# VMIs — but instancesV2 stays disabled: for vCluster private nodes, node
+# initialisation/lifecycle belongs to vCluster's embedded cloud provider,
+# which sets providerID "vcluster://...". This CCM only runs the service
+# (LoadBalancer) controller.
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: {{ $name }}
+  namespace: {{ $.Release.Namespace }}
+  labels:
+    {{- include "vpcc.labels" $ | nindent 4 }}
+    app.kubernetes.io/component: {{ $cluster.name }}
+data:
+  cloud-config: |
+    loadBalancer:
+      enabled: true
+      creationPollInterval: {{ ($cluster.loadBalancer).creationPollInterval | default 5 }}
+      creationPollTimeout: {{ ($cluster.loadBalancer).creationPollTimeout | default 60 }}
+    instancesV2:
+      enabled: false
+    namespace: {{ $cluster.vmNamespace }}
+    infraLabels:
+      app.kubernetes.io/managed-by: {{ include "vpcc.name" $ }}
+      {{- with $cluster.infraLabels }}
+      {{- toYaml . | nindent 6 }}
+      {{- end }}
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: {{ $name }}
+  namespace: {{ $.Release.Namespace }}
+  labels:
+    {{- include "vpcc.labels" $ | nindent 4 }}
+    app.kubernetes.io/component: {{ $cluster.name }}
+spec:
+  replicas: {{ $.Values.replicas }}
+  selector:
+    matchLabels:
+      app.kubernetes.io/name: {{ include "vpcc.name" $ }}
+      app.kubernetes.io/instance: {{ $.Release.Name }}
+      app.kubernetes.io/component: {{ $cluster.name }}
+  template:
+    metadata:
+      labels:
+        app.kubernetes.io/name: {{ include "vpcc.name" $ }}
+        app.kubernetes.io/instance: {{ $.Release.Name }}
+        app.kubernetes.io/component: {{ $cluster.name }}
+        {{- with $.Values.podLabels }}
+        {{- toYaml . | nindent 8 }}
+        {{- end }}
+      annotations:
+        # Roll the pod when its cloud-config changes.
+        checksum/cloud-config: {{ printf "%s-%s-%v-%v" $cluster.vmNamespace $clusterName ($cluster.loadBalancer | default dict) ($cluster.infraLabels | default dict) | sha256sum }}
+        {{- with $.Values.podAnnotations }}
+        {{- toYaml . | nindent 8 }}
+        {{- end }}
+    spec:
+      serviceAccountName: {{ include "vpcc.serviceAccountName" $ }}
+      {{- with $.Values.imagePullSecrets }}
+      imagePullSecrets:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+      {{- with $.Values.podSecurityContext }}
+      securityContext:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+      containers:
+        - name: cloud-controller-manager
+          image: {{ include "vpcc.image" $ }}
+          imagePullPolicy: {{ $.Values.image.pullPolicy }}
+          command:
+            - /bin/kubevirt-cloud-controller-manager
+          args:
+            - --cloud-provider=kubevirt
+            - --cloud-config=/etc/cloud/cloud-config
+            # Kubeconfig for the GUEST cluster — the CCM's "own" cluster,
+            # whose Services it watches and whose Service status it updates.
+            - --kubeconfig=/etc/kubernetes/kubeconfig/value
+            - --cluster-name={{ $clusterName }}
+            # Only the service (LoadBalancer) controller. cloud-node and
+            # cloud-node-lifecycle must stay off: vCluster's embedded cloud
+            # provider owns the nodes and its vcluster:// providerIDs would
+            # make the kubevirt node-lifecycle controller treat every guest
+            # node as unparseable/nonexistent.
+            - --controllers={{ join "," ($cluster.controllers | default (list "service")) }}
+            # Single replica per guest; leader election would put a lease in
+            # the guest's kube-system next to vCluster's own components for
+            # no benefit.
+            - --leader-elect=false
+            - --secure-port=10258
+            {{- range $cluster.extraArgs }}
+            - {{ . }}
+            {{- end }}
+          ports:
+            - name: https
+              containerPort: 10258
+              protocol: TCP
+          livenessProbe:
+            httpGet:
+              path: /healthz
+              port: https
+              scheme: HTTPS
+            initialDelaySeconds: 10
+            periodSeconds: 20
+          {{- with $.Values.containerSecurityContext }}
+          securityContext:
+            {{- toYaml . | nindent 12 }}
+          {{- end }}
+          {{- with $.Values.resources }}
+          resources:
+            {{- toYaml . | nindent 12 }}
+          {{- end }}
+          volumeMounts:
+            - name: kubeconfig
+              mountPath: /etc/kubernetes/kubeconfig
+              readOnly: true
+            - name: cloud-config
+              mountPath: /etc/cloud
+              readOnly: true
+            # The CCM generates its serving cert under /var/run/kubernetes;
+            # an emptyDir keeps the root filesystem read-only.
+            - name: serving-certs
+              mountPath: /var/run/kubernetes
+      volumes:
+        - name: kubeconfig
+          secret:
+            secretName: {{ $cluster.kubeconfigSecret.name }}
+            items:
+              - key: {{ $cluster.kubeconfigSecret.key | default "kubeconfig" }}
+                path: value
+        - name: cloud-config
+          configMap:
+            name: {{ $name }}
+        - name: serving-certs
+          emptyDir: {}
+      {{- with $.Values.nodeSelector }}
+      nodeSelector:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+      {{- with $.Values.tolerations }}
+      tolerations:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+      {{- with $.Values.affinity }}
+      affinity:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+{{- end }}

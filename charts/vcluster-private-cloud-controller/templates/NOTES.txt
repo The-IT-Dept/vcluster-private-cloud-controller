@@ -1,0 +1,19 @@
+{{- if not .Values.clusters }}
+No guest clusters configured. Add entries under .Values.clusters — nothing was
+deployed beyond the ServiceAccount.
+{{- else }}
+Deployed a cloud-controller-manager for {{ len .Values.clusters }} guest cluster(s):
+{{- range .Values.clusters }}
+  - {{ .name }} (VMs in host namespace {{ .vmNamespace }})
+{{- end }}
+
+For each guest cluster, make sure its KubeVirt VirtualMachines carry these
+labels in spec.template.metadata.labels (KubeVirt copies them to the
+virt-launcher pods, which the host-side LoadBalancer Services select):
+
+  cluster.x-k8s.io/cluster-name: <clusterName>
+  cluster.x-k8s.io/role: worker
+
+A `type: LoadBalancer` Service created inside a guest should then receive an
+address from the host cluster's pool within seconds.
+{{- end }}

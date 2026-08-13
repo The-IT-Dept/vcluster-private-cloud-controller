@@ -1,0 +1,37 @@
+# Example values: two vCluster private-nodes guest clusters.
+# All names are placeholders — substitute your own.
+
+clusters:
+  # Minimal entry.
+  - name: tenant-a
+    # Host-cluster namespace containing tenant-a's KubeVirt VirtualMachines.
+    # The host-side LoadBalancer Services are created here.
+    vmNamespace: tenant-a-vms
+    # Secret in the chart's release namespace. Its kubeconfig must reach the
+    # guest API from host pods, e.g. server: https://tenant-a.vc-tenant-a.svc
+    kubeconfigSecret:
+      name: tenant-a-guest-kubeconfig
+      key: kubeconfig
+
+  # Everything overridable.
+  - name: tenant-b
+    # The value the VMs must carry in cluster.x-k8s.io/cluster-name
+    # (defaults to .name).
+    clusterName: tenant-b-prod
+    vmNamespace: tenant-b-vms
+    kubeconfigSecret:
+      name: tenant-b-guest-kubeconfig
+    loadBalancer:
+      creationPollInterval: 3
+      creationPollTimeout: 120
+    # Stamped on every host Service this instance creates; handy for GC.
+    infraLabels:
+      example.com/tenant: tenant-b
+    extraArgs:
+      - --v=2
+
+# The VirtualMachines for tenant-a then need, under
+# spec.template.metadata.labels:
+#
+#   cluster.x-k8s.io/cluster-name: tenant-a
+#   cluster.x-k8s.io/role: worker

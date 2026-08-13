@@ -101,6 +101,10 @@ spec:
             # no benefit.
             - --leader-elect=false
             - --secure-port=10258
+            # Don't require read access to kube-system/extension-apiserver-
+            # authentication in the host cluster — the secure port only serves
+            # healthz/metrics here, and the lookup failure is fatal otherwise.
+            - --authentication-skip-lookup=true
             {{- range $cluster.extraArgs }}
             - {{ . }}
             {{- end }}

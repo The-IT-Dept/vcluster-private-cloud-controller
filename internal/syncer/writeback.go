@@ -211,7 +211,13 @@ func (p *pass) writeRefusals(ctx context.Context) {
 			continue
 		}
 		if desired != "" {
-			p.guestEvent(ctx, obj, ref.gvk, corev1.EventTypeWarning, "HostnameRefused", desired)
+			// PVC refusals are about access modes and volume modes, not
+			// hostnames; the event reason should say what kind of rule fired.
+			reason := "HostnameRefused"
+			if ref.gvk == pvcGVK {
+				reason = "SyncRefused"
+			}
+			p.guestEvent(ctx, obj, ref.gvk, corev1.EventTypeWarning, reason, desired)
 		}
 	}
 }

@@ -46,6 +46,12 @@ const TenantClusterFinalizer = "vcluster.the-it-dept.io/tenant-cleanup"
 // the durable, kubectl-visible record; the Event carries the same text.
 const RefusedAnnotation = "vcluster.the-it-dept.io/refused"
 
+// AllowedDomainsAnnotation publishes the tenant's hostname grant on the
+// GatewayClass mirrored into their guest. A tenant cannot read their own
+// TenantCluster (it lives on the host), so without this the only way to
+// discover which hostnames are permitted is to have one refused.
+const AllowedDomainsAnnotation = "vcluster.the-it-dept.io/allowed-domains"
+
 // FieldManager identifies this controller's writes.
 const FieldManager = "vcluster-tenant-syncer"
 

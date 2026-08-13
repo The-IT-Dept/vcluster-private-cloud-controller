@@ -286,8 +286,15 @@ func TestMirrorGatewayClassNamesOurOwnController(t *testing.T) {
 	if gc.Labels[ManagedByLabel] != ManagedByValue {
 		t.Errorf("the mirror must be identifiable for prune, got %v", gc.Labels)
 	}
-	if gc.Spec.Description == nil || !strings.Contains(*gc.Spec.Description, "app.example.com") {
-		t.Errorf("the description should tell the tenant which hostnames are allowed, got %v", gc.Spec.Description)
+	// spec.description is capped at 64 bytes by the CRD — a real limit that a
+	// list of allowed domains blows straight past.
+	if gc.Spec.Description == nil || len(*gc.Spec.Description) > 64 {
+		t.Errorf("description must exist and fit the CRD's 64-byte cap, got %v", gc.Spec.Description)
+	}
+	// The tenant cannot read their own TenantCluster, so the grant has to
+	// reach them somehow.
+	if !strings.Contains(gc.Annotations[AllowedDomainsAnnotation], "app.example.com") {
+		t.Errorf("the allowed domains must be published to the tenant, got %v", gc.Annotations)
 	}
 }
 

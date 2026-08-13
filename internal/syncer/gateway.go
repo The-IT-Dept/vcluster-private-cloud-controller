@@ -41,12 +41,16 @@ const GuestGatewayControllerName = "vcluster.the-it-dept.io/tenant-syncer"
 //
 // It carries the host name unchanged, because the pass maps it back by name.
 func mirrorGatewayClass(tc *v1alpha1.TenantCluster) *gwv1.GatewayClass {
-	desc := fmt.Sprintf("Gateways on this class are published on the host cluster by the tenant syncer. Allowed hostnames: %s.",
-		describeDomains(tc.Spec.AllowedDomains))
+	// spec.description is capped at 64 bytes by the CRD, so it says only what
+	// the class IS. The allowed domains — the thing a tenant most needs and the
+	// one part with no length bound — go in an annotation, where they are also
+	// machine-readable instead of prose to be parsed.
+	desc := "Published on the host cluster by the tenant syncer."
 	return &gwv1.GatewayClass{
 		ObjectMeta: metav1.ObjectMeta{
-			Name:   tc.Spec.GatewayClassName,
-			Labels: map[string]string{ManagedByLabel: ManagedByValue},
+			Name:        tc.Spec.GatewayClassName,
+			Labels:      map[string]string{ManagedByLabel: ManagedByValue},
+			Annotations: map[string]string{AllowedDomainsAnnotation: describeDomains(tc.Spec.AllowedDomains)},
 		},
 		Spec: gwv1.GatewayClassSpec{
 			ControllerName: GuestGatewayControllerName,
@@ -70,9 +74,9 @@ func gatewayClassAcceptedCondition(generation int64) metav1.Condition {
 
 func describeDomains(domains []string) string {
 	if len(domains) == 0 {
-		return "none configured, so every Gateway hostname will be refused"
+		return "(none configured: every Gateway hostname will be refused)"
 	}
-	return strings.Join(domains, ", ")
+	return strings.Join(domains, ",")
 }
 
 // mapGateway translates one guest Gateway. Listeners whose hostname fails

@@ -369,9 +369,13 @@ func (p *pass) reconcileGuestGatewayClass(ctx context.Context) {
 			}
 			existing = *want
 		} else if !equality.Semantic.DeepEqual(existing.Spec.Description, want.Spec.Description) ||
-			existing.Labels[ManagedByLabel] != ManagedByValue {
+			existing.Labels[ManagedByLabel] != ManagedByValue ||
+			existing.Annotations[AllowedDomainsAnnotation] != want.Annotations[AllowedDomainsAnnotation] {
+			// Re-asserted every pass, so an operator widening allowedDomains shows
+			// up to the tenant without anything else having to happen.
 			existing.Spec.Description = want.Spec.Description
 			existing.Labels = mergeLabels(existing.Labels, want.Labels)
+			existing.Annotations = mergeLabels(existing.Annotations, want.Annotations)
 			if err := p.guest.Update(ctx, &existing); err != nil {
 				p.problems = append(p.problems, fmt.Sprintf("updating guest GatewayClass %q: %v", wanted, err))
 				return

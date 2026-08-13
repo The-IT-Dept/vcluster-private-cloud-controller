@@ -14,6 +14,7 @@ import (
 	"sigs.k8s.io/controller-runtime/pkg/client"
 	"sigs.k8s.io/controller-runtime/pkg/controller/controllerutil"
 
+	"github.com/the-it-dept/vcluster-private-cloud-controller/api/v1alpha1"
 	"github.com/the-it-dept/vcluster-private-cloud-controller/internal/csinode"
 	"github.com/the-it-dept/vcluster-private-cloud-controller/internal/kubevirt"
 )
@@ -197,11 +198,11 @@ func newFakeHotplug(vmNames ...string) *fakeHotplug {
 	return f
 }
 
-func (f *fakeHotplug) AddVolume(_ context.Context, _, vm, vol, _, _ string) error {
+func (f *fakeHotplug) AddVolume(_ context.Context, _, vm, vol, claim, _ string) error {
 	if _, ok := f.vms[vm]; !ok {
 		return apierrors.NewNotFound(corev1.Resource("virtualmachines"), vm)
 	}
-	f.vms[vm][vol] = kubevirt.VolumeState{InSpec: true, Phase: kubevirt.Ready}
+	f.vms[vm][vol] = kubevirt.VolumeState{InSpec: true, Phase: kubevirt.Ready, Claim: claim}
 	f.added = append(f.added, vm+"/"+vol)
 	return nil
 }
@@ -514,6 +515,61 @@ func TestTenantClusterTeardownUnplugsAndDeletesStorage(t *testing.T) {
 	var sc storagev1.StorageClass
 	if err := f.guest.Get(context.Background(), client.ObjectKey{Name: "fast"}, &sc); !apierrors.IsNotFound(err) {
 		t.Errorf("mirrored guest StorageClass should be deleted, err=%v", err)
+	}
+}
+
+func TestOrphanedVMSpecVolumeIsRemoved(t *testing.T) {
+	// Found live: a hotplug volume welded into a VM whose host PVC is gone.
+	// Nothing references it, and it BLOCKS every later hotplug on that VM
+	// (KubeVirt processes a VMI's hotplug volumes as a batch). The pass must
+	// sweep it out — and must NOT touch volumes whose claim exists, or volumes
+	// this controller cannot prove it created.
+	f := newFixture(t, false, nil, []client.Object{
+		offerableHostSC("fast"),
+		// A live claim: its volume must be left alone.
+		&corev1.PersistentVolumeClaim{ObjectMeta: metav1.ObjectMeta{
+			Name: "pn1-pvc-live", Namespace: "tenant-pn1",
+		}},
+	})
+	orphanVol := VolumeName("pn1-pvc-dead")
+	f.hot.vms["node-a"][orphanVol] = kubevirt.VolumeState{InSpec: true, Phase: "Pending", Claim: "pn1-pvc-dead"}
+	f.hot.vms["node-a"][VolumeName("pn1-pvc-live")] = kubevirt.VolumeState{InSpec: true, Phase: kubevirt.Ready, Claim: "pn1-pvc-live"}
+	// Not ours: name does not derive from the claim. Never touched, even with
+	// the claim missing.
+	f.hot.vms["node-a"]["cloudinit"] = kubevirt.VolumeState{InSpec: true, Claim: "some-other-pvc"}
+
+	f.reconcile(t)
+
+	if want := "node-a/" + orphanVol; len(f.hot.removed) != 1 || f.hot.removed[0] != want {
+		t.Fatalf("exactly the orphaned volume must be removed, removed=%v want=[%s]", f.hot.removed, want)
+	}
+}
+
+func TestTeardownRefusesToFinishOverOrphanedVMVolume(t *testing.T) {
+	// The race that created the orphan: an addvolume still queued in KubeVirt's
+	// volumeRequests materializes after teardown observed "clean". VMs() now
+	// reports a queued add as InSpec, and teardown must hold the finalizer
+	// until the volume is truly gone.
+	f := newFixture(t, false, nil, []client.Object{offerableHostSC("fast")})
+	orphanVol := VolumeName("pn1-pvc-dead")
+	f.hot.vms["node-a"][orphanVol] = kubevirt.VolumeState{InSpec: true, Claim: "pn1-pvc-dead"}
+
+	tc := f.getTC(t)
+	if err := f.host.Delete(context.Background(), tc); err != nil {
+		t.Fatal(err)
+	}
+	f.reconcile(t) // teardown pass 1: sweep issues the unplug, finalizer holds
+	if want := "node-a/" + orphanVol; len(f.hot.removed) != 1 || f.hot.removed[0] != want {
+		t.Fatalf("teardown must unplug the orphaned volume, removed=%v want=[%s]", f.hot.removed, want)
+	}
+	var held v1alpha1.TenantCluster
+	if err := f.host.Get(context.Background(), client.ObjectKey{Name: "pn1", Namespace: "syncer"}, &held); err != nil {
+		t.Fatalf("TenantCluster must still be held while the orphan is attached: %v", err)
+	}
+
+	f.reconcile(t) // orphan observed gone → finalizer drops
+	if err := f.host.Get(context.Background(), client.ObjectKey{Name: "pn1", Namespace: "syncer"}, &held); !apierrors.IsNotFound(err) {
+		t.Fatalf("TenantCluster should be released once the orphan is gone, err=%v", err)
 	}
 }
 

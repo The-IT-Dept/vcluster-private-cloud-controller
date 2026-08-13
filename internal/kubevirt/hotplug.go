@@ -30,12 +30,19 @@ var (
 // one VM: whether the request is recorded in the VM spec, and how far the
 // attach has actually progressed on the running VMI.
 type VolumeState struct {
-	// InSpec: the volume is in the VirtualMachine's template spec, so KubeVirt
-	// will (re-)attach it, including after a VM restart.
+	// InSpec: the volume is in the VirtualMachine's template spec — or in a
+	// queued status.volumeRequests add that virt-controller has not applied to
+	// the spec yet. A queued add IS desired state: it will materialize whether
+	// or not this controller still wants it, so treating it as anything less
+	// lets a teardown observe "clean" moments before the volume reappears.
 	InSpec bool
 	// Phase is the VMI volumeStatus phase: "AttachedToNode", "Ready", etc.
 	// Empty until the VMI reports the volume.
 	Phase string
+	// Claim is the PVC the volume points at, when the volume is PVC-backed.
+	// The syncer uses it to spot orphans: a hotplug volume whose claim no
+	// longer exists can never attach, and blocks every later hotplug on the VM.
+	Claim string
 }
 
 // Ready is the VMI volumeStatus phase meaning the disk is visible inside the
@@ -133,6 +140,18 @@ func (c *Client) put(ctx context.Context, namespace, vm, verb string, body []byt
 	return nil
 }
 
+// claimOf extracts persistentVolumeClaim.claimName from a VM spec volume or an
+// addVolumeOptions volumeSource — the two places KubeVirt spells a PVC-backed
+// volume the same way.
+func claimOf(m map[string]any) string {
+	pvc, ok := m["persistentVolumeClaim"].(map[string]any)
+	if !ok {
+		return ""
+	}
+	claim, _ := pvc["claimName"].(string)
+	return claim
+}
+
 // VMs lists the VirtualMachines in a namespace with the state of every volume
 // on each, VM spec and VMI status merged. One call per pass, not one per
 // VolumeAttachment.
@@ -153,8 +172,38 @@ func (c *Client) VMs(ctx context.Context, namespace string) (map[string]map[stri
 			}
 			name, _ := m["name"].(string)
 			if name != "" {
-				vols[name] = VolumeState{InSpec: true}
+				vols[name] = VolumeState{InSpec: true, Claim: claimOf(m)}
 			}
+		}
+		// Queued volume requests. KubeVirt's addvolume/removevolume subresources
+		// do not edit the spec synchronously — they append to
+		// status.volumeRequests, and virt-controller applies them later. An
+		// unapplied add must count as InSpec: observed live, a TenantCluster
+		// teardown that raced this queue saw the volume as gone, deleted the
+		// host PVC, and the applied-afterwards add left an orphan hotplug volume
+		// that blocked every subsequent attach on that VM.
+		reqs, _, _ := unstructured.NestedSlice(vm.Object, "status", "volumeRequests")
+		for _, rq := range reqs {
+			m, ok := rq.(map[string]any)
+			if !ok {
+				continue
+			}
+			add, ok := m["addVolumeOptions"].(map[string]any)
+			if !ok {
+				continue
+			}
+			name, _ := add["name"].(string)
+			if name == "" {
+				continue
+			}
+			st := vols[name]
+			st.InSpec = true
+			if st.Claim == "" {
+				if vs, ok := add["volumeSource"].(map[string]any); ok {
+					st.Claim = claimOf(vs)
+				}
+			}
+			vols[name] = st
 		}
 		out[vm.GetName()] = vols
 	}

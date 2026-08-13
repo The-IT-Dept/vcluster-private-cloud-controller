@@ -472,6 +472,17 @@ func (p *pass) pruneStorage(ctx context.Context) {
 		}
 	}
 
+	// Hotplug volumes welded into a VM whose backing host PVC is GONE. Nothing
+	// else cleans these — no guest PVC, no VA, no host PVC references them —
+	// and one is not inert clutter: KubeVirt processes a VMI's hotplug volumes
+	// as a batch, so a single volume stuck on a missing claim blocks every
+	// later attach to that VM. Found live, left behind by a teardown that
+	// raced KubeVirt's async volumeRequests queue.
+	removeOrphanVMVolumes(ctx, p.hot, p.hostReader, p.tc.Spec.HostNamespace, st.vms,
+		func(format string, args ...any) {
+			p.problems = append(p.problems, fmt.Sprintf(format, args...))
+		})
+
 	// Guest StorageClasses whose host class is no longer offerable. PVCs and
 	// volumes on the class are untouched: un-offering stops NEW provisioning,
 	// it does not strand data.
@@ -554,6 +565,42 @@ func (p *pass) volumeUnplugged(ctx context.Context, hostPVCName string) bool {
 	return clear
 }
 
+// removeOrphanVMVolumes issues removevolume for every hotplug volume this
+// controller created — provable: the volume's name is derived from its claim —
+// whose host PVC no longer exists. Claim existence is checked UNCACHED, because
+// a stale "missing" here would detach a live volume. Returns clean=false while
+// any such volume is still present (removal issued or mid-unplug), so callers
+// in teardown can refuse to finish over one.
+func removeOrphanVMVolumes(ctx context.Context, hot Hotplugger, reader client.Reader, namespace string,
+	vms map[string]map[string]kubevirt.VolumeState, report func(format string, args ...any)) (clean bool) {
+	clean = true
+	for vmName, vols := range vms {
+		for volName, vol := range vols {
+			if vol.Claim == "" || VolumeName(vol.Claim) != volName {
+				continue // not a volume this controller created
+			}
+			var pvc corev1.PersistentVolumeClaim
+			err := reader.Get(ctx, client.ObjectKey{Namespace: namespace, Name: vol.Claim}, &pvc)
+			switch {
+			case err == nil:
+				continue // claim exists; the normal lifecycle owns this volume
+			case !apierrors.IsNotFound(err):
+				report("checking claim %q behind VM %s volume %s: %v", vol.Claim, vmName, volName, err)
+				clean = false
+				continue
+			}
+			clean = false
+			if !vol.InSpec {
+				continue // already mid-unplug; wait for the VMI to let go
+			}
+			if err := hot.RemoveVolume(ctx, namespace, vmName, volName); err != nil {
+				report("removing orphaned volume %s (claim %q gone) from VM %s: %v", volName, vol.Claim, vmName, err)
+			}
+		}
+	}
+	return clean
+}
+
 // --- TenantCluster teardown -------------------------------------------------
 
 // storageTeardown is the storage half of deleting a TenantCluster: unplug and
@@ -568,10 +615,10 @@ func (r *TenantClusterReconciler) storageTeardown(ctx context.Context, tc *v1alp
 	}); err != nil {
 		return false, err
 	}
-	if len(pvcs.Items) == 0 {
-		return true, nil
-	}
 	if r.Hotplug == nil {
+		if len(pvcs.Items) == 0 {
+			return true, nil
+		}
 		// Host PVCs exist but there is no way to prove they are unplugged.
 		// Refusing to guess is the only safe answer.
 		return false, fmt.Errorf("host PVCs remain for TenantCluster %s but no hotplug client is configured", tc.Name)
@@ -610,6 +657,17 @@ func (r *TenantClusterReconciler) storageTeardown(ctx context.Context, tc *v1alp
 			logf.FromContext(ctx).Error(err, "deleting host PVC during teardown", "name", pvc.Name)
 			done = false
 		}
+	}
+	// Sweep hotplug volumes whose claim is already gone — including adds still
+	// queued in KubeVirt's volumeRequests, which VMs() reports as InSpec. The
+	// finalizer must not drop while one exists: it would materialize after the
+	// TenantCluster is gone and block that VM's hotplug forever.
+	log := logf.FromContext(ctx)
+	if !removeOrphanVMVolumes(ctx, r.Hotplug, r.Reader, tc.Spec.HostNamespace, vms,
+		func(format string, args ...any) {
+			log.Info(fmt.Sprintf("storage teardown: "+format, args...))
+		}) {
+		done = false
 	}
 	return done, nil
 }

@@ -113,6 +113,35 @@ spec:
                 required:
                 - name
                 type: object
+              limits:
+                description: |-
+                  Limits caps what this tenant may consume of scarce HOST resources. Like
+                  AllowedDomains it lives on the host, so a tenant cannot edit it — which is
+                  the whole point: a tenant has cluster-admin in their own cluster and could
+                  otherwise create a hundred LoadBalancer Services.
+                properties:
+                  loadBalancers:
+                    description: |-
+                      LoadBalancers is the number of host objects this tenant may hold that
+                      CONSUME A POOL ADDRESS: LoadBalancer Services and Gateways together.
+                      Absent means unlimited — the right default for a single-tenant region and
+                      the wrong one for a shared one.
+
+                      Counted per LOGICAL ENDPOINT, not per address: a dual-stack Service takes
+                      one IPv4 and one IPv6 but counts once, because it is one thing a customer
+                      asked for. The scarce family is IPv4 and it is what this number really
+                      protects; if IPv6-only ever needs a larger allowance that is a second
+                      field, not a reinterpretation of this one.
+
+                      LOWERING IT BELOW CURRENT USAGE TEARS NOTHING DOWN. It stops the tenant
+                      growing; what already runs keeps running. The alternative — an operator
+                      edits a number and a customer's production endpoint disappears — is not a
+                      trade worth having, and it matches how GPU quota already behaves in this
+                      platform.
+                    format: int32
+                    minimum: 0
+                    type: integer
+                type: object
               nodeSelector:
                 description: |-
                   NodeSelector finds this tenant's node pods on the host. Host Services
@@ -232,6 +261,16 @@ spec:
                   succeeded. While false the syncer touches NOTHING on the host: a tenant's
                   published address must not disappear because its API server restarted.
                 type: boolean
+              hostAddressFamilies:
+                description: |-
+                  HostAddressFamilies is what the HOST cluster can allocate, discovered from
+                  its ServiceCIDRs. A guest asking for a family not in this list is refused
+                  with a reason instead of sitting <pending> forever. Empty means discovery
+                  found nothing (an older host, or no permission on ServiceCIDRs) and every
+                  family is passed through for the host API server to judge.
+                items:
+                  type: string
+                type: array
               lastSyncTime:
                 description: |-
                   LastSyncTime is when a full pass last completed against a reachable
@@ -239,6 +278,13 @@ spec:
                   host-side state might be.
                 format: date-time
                 type: string
+              loadBalancerUsage:
+                description: |-
+                  LoadBalancerUsage is how many logical endpoints (LoadBalancer Services +
+                  Gateways) this tenant currently holds on the host — the number checked
+                  against spec.limits.loadBalancers. Published so an operator can see how
+                  close a tenant is to its cap without counting objects by hand.
+                type: integer
               observedResources:
                 description: |-
                   ResourceCounts is how many guest resources the last completed pass saw in
@@ -249,6 +295,12 @@ spec:
                   httpRoutes:
                     type: integer
                   ingresses:
+                    type: integer
+                  loadBalancers:
+                    description: |-
+                      LoadBalancers is the number of LOGICAL ENDPOINTS admitted this pass:
+                      LoadBalancer Services and Gateways together, the thing
+                      spec.limits.loadBalancers caps. Refused ones are not counted.
                     type: integer
                   persistentVolumeClaims:
                     type: integer

@@ -14,6 +14,7 @@ import (
 	"k8s.io/apimachinery/pkg/api/meta"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/runtime/schema"
+	"k8s.io/apimachinery/pkg/types"
 	"sigs.k8s.io/controller-runtime/pkg/client"
 	gwv1 "sigs.k8s.io/gateway-api/apis/v1"
 
@@ -39,6 +40,12 @@ type pass struct {
 
 	gatewayAPIOnHost bool
 
+	// hostFamilies is what the HOST cluster can allocate addresses in,
+	// discovered once per pass from its ServiceCIDRs. Empty means "could not
+	// tell", and every family is then passed through for the host API server to
+	// judge — see unsupportedFamilyRefusal.
+	hostFamilies []corev1.IPFamily
+
 	// Storage collaborators, injected from the reconciler: the KubeVirt
 	// hotplug surface and the images for the guest node plugin.
 	hot    Hotplugger
@@ -55,6 +62,18 @@ type pass struct {
 
 	// All guest Services by namespace/name — backends resolve against this.
 	guestSvcs map[guestKey]*corev1.Service
+
+	// backendNeeded holds host Service names some Ingress or HTTPRoute routes
+	// to. A LoadBalancer Service refused by the address limit still has to exist
+	// as a ClusterIP if a synced Ingress points at it: the limit is on ADDRESSES,
+	// not on being reachable.
+	backendNeeded map[string]bool
+
+	// hostOwner maps a host object name back to the guest object it came from,
+	// so an apply failure (an address family the host API server rejects, most
+	// of all) is reported ON THE GUEST OBJECT and not only on the TenantCluster
+	// where no tenant can see it.
+	hostOwner map[string]guestObjRef
 
 	// guestObjs holds every non-deleting guest object in scope, so refusals and
 	// finalizers can be written to the object that was actually listed.
@@ -114,10 +133,11 @@ var (
 	routeGVK   = gwv1.SchemeGroupVersion.WithKind("HTTPRoute")
 )
 
-func newPass(tc *v1alpha1.TenantCluster, host client.Client, hostReader client.Reader, guest client.Client, gatewayAPIOnHost bool, hot Hotplugger, images NodePluginImages, log logr.Logger) *pass {
+func newPass(tc *v1alpha1.TenantCluster, host client.Client, hostReader client.Reader, guest client.Client, gatewayAPIOnHost bool, hostFamilies []corev1.IPFamily, hot Hotplugger, images NodePluginImages, log logr.Logger) *pass {
 	return &pass{
 		tc: tc, host: host, hostReader: hostReader, guest: guest, log: log,
 		gatewayAPIOnHost: gatewayAPIOnHost,
+		hostFamilies:     hostFamilies,
 		hot:              hot, images: images,
 		services:         map[string]*corev1.Service{},
 		ingresses:        map[string]*netv1.Ingress{},
@@ -127,6 +147,8 @@ func newPass(tc *v1alpha1.TenantCluster, host client.Client, hostReader client.R
 		guestObjs:        map[guestObjRef]client.Object{},
 		wantFinalizer:    map[guestObjRef]bool{},
 		refusals:         map[guestObjRef][]string{},
+		backendNeeded:    map[string]bool{},
+		hostOwner:        map[string]guestObjRef{},
 	}
 }
 
@@ -149,6 +171,10 @@ func (p *pass) run(ctx context.Context) error {
 			return fmt.Errorf("listing guest gateway resources: %w", err)
 		}
 	}
+	// Address limits are applied AFTER every gather, because the count spans
+	// Services and Gateways together and the backend-reuse set is only complete
+	// once Ingresses and HTTPRoutes have been walked.
+	p.applyAddressLimit(ctx)
 	// The guest GatewayClass is advertised BEFORE the rest of the pass so a
 	// tenant with no Gateways yet still has something to name; it is what makes
 	// the first Gateway writable at all.
@@ -204,13 +230,14 @@ func (p *pass) gatherServices(ctx context.Context) error {
 		}
 		p.guestObjs[ref] = svc
 		p.counts.Services++
-		hostSvc, refusal := mapService(p.tc, svc, corev1.ServiceTypeLoadBalancer)
+		hostSvc, refusal := mapService(p.tc, svc, corev1.ServiceTypeLoadBalancer, p.hostFamilies)
 		if refusal != "" {
 			p.refuse(ref, refusal)
 			continue
 		}
 		p.services[hostSvc.Name] = hostSvc
 		p.lbPairs = append(p.lbPairs, svcPair{guest: svc, hostName: hostSvc.Name})
+		p.hostOwner[hostSvc.Name] = ref
 		p.wantFinalizer[ref] = true
 	}
 	return nil
@@ -271,6 +298,7 @@ func (p *pass) gatherGateways(ctx context.Context) error {
 		}
 		p.gateways[host.Name] = host
 		p.gatewayPairs = append(p.gatewayPairs, gatewayPair{guest: gw, hostName: host.Name})
+		p.hostOwner[host.Name] = ref
 		p.wantFinalizer[ref] = true
 	}
 
@@ -302,6 +330,160 @@ func (p *pass) gatherGateways(ctx context.Context) error {
 		p.addBackends(rt.Namespace, res.backends)
 	}
 	return nil
+}
+
+// --- address limits (design §3.6) -------------------------------------------
+
+// addressClaim is one LOGICAL ENDPOINT a tenant is asking the host to publish:
+// a LoadBalancer Service or a Gateway. A dual-stack Service takes an IPv4 and
+// an IPv6 address but is one claim, because it is one thing a customer asked
+// for; the scarce family is IPv4 and that is what the number protects.
+type addressClaim struct {
+	ref      guestObjRef
+	hostName string
+	created  metav1.Time
+	uid      types.UID
+	// existing is true when a host object for this claim is already on the host.
+	// Those are admitted whatever the limit says — LOWERING A LIMIT MUST NOT
+	// TEAR ANYTHING DOWN. It stops the tenant growing; what runs keeps running.
+	existing bool
+}
+
+// applyAddressLimit enforces spec.limits.loadBalancers.
+//
+// Determinism is the requirement that shapes this: claims are ordered by
+// creation timestamp with UID as the tie-break, so which endpoint is refused
+// cannot flap between reconciles. A controller that re-sorted a Go map would
+// take a tenant's working endpoint up and down forever.
+func (p *pass) applyAddressLimit(ctx context.Context) {
+	limit, capped := p.tc.LoadBalancerLimit()
+
+	claims := make([]addressClaim, 0, len(p.lbPairs)+len(p.gatewayPairs))
+	for _, pair := range p.lbPairs {
+		claims = append(claims, addressClaim{
+			ref:      guestObjRef{svcGVK, guestKey{pair.guest.Namespace, pair.guest.Name}},
+			hostName: pair.hostName,
+			created:  pair.guest.CreationTimestamp,
+			uid:      pair.guest.UID,
+		})
+	}
+	for _, pair := range p.gatewayPairs {
+		claims = append(claims, addressClaim{
+			ref:      guestObjRef{gatewayGVK, guestKey{pair.guest.Namespace, pair.guest.Name}},
+			hostName: pair.hostName,
+			created:  pair.guest.CreationTimestamp,
+			uid:      pair.guest.UID,
+		})
+	}
+	sort.Slice(claims, func(i, j int) bool {
+		if !claims[i].created.Equal(&claims[j].created) {
+			return claims[i].created.Before(&claims[j].created)
+		}
+		return claims[i].uid < claims[j].uid
+	})
+
+	if !capped {
+		p.counts.LoadBalancers = len(claims)
+		return
+	}
+
+	// Which claims already hold a host object. Read UNCACHED and per object:
+	// "already published" is the difference between grandfathering a customer's
+	// live endpoint and deleting it, so it must not be answered from a cache
+	// that a moment ago was filtered or stale.
+	for i := range claims {
+		claims[i].existing = p.hostObjectExists(ctx, &claims[i])
+	}
+
+	admitted := 0
+	var refused []addressClaim
+	for i := range claims {
+		if claims[i].existing {
+			admitted++ // grandfathered: never torn down by a limit change
+			continue
+		}
+		if admitted < limit {
+			admitted++
+			continue
+		}
+		refused = append(refused, claims[i])
+	}
+	p.counts.LoadBalancers = admitted
+
+	for _, c := range refused {
+		p.refuse(c.ref, fmt.Sprintf(
+			"address limit reached: this cluster may hold %d host endpoint(s) consuming an address "+
+				"(LoadBalancer Services and Gateways together) and %d are in use; "+
+				"delete one, or ask the operator to raise the limit",
+			limit, admitted))
+		p.withdrawClaim(c)
+	}
+}
+
+// hostObjectExists answers whether the host object for a claim is already
+// there AND ours. An object bearing the name but not our labels is somebody
+// else's; it must not count as this tenant's, and the apply guard refuses it
+// separately.
+func (p *pass) hostObjectExists(ctx context.Context, c *addressClaim) bool {
+	key := client.ObjectKey{Namespace: p.tc.Spec.HostNamespace, Name: c.hostName}
+	switch c.ref.gvk {
+	case svcGVK:
+		var have corev1.Service
+		if err := p.hostReader.Get(ctx, key, &have); err != nil {
+			return false
+		}
+		// A ClusterIP object under this name is a BACKEND Service, not a
+		// published address: it consumes nothing from the pool and must not
+		// grandfather a LoadBalancer into existence.
+		return ownedBy(&have, p.tc) && have.Spec.Type == corev1.ServiceTypeLoadBalancer
+	case gatewayGVK:
+		if !p.gatewayAPIOnHost {
+			return false
+		}
+		var have gwv1.Gateway
+		if err := p.hostReader.Get(ctx, key, &have); err != nil {
+			return false
+		}
+		return ownedBy(&have, p.tc)
+	}
+	return false
+}
+
+// withdrawClaim removes a refused endpoint from the desired host state.
+//
+// A refused LoadBalancer Service that some synced Ingress or HTTPRoute routes
+// to is DOWNGRADED to a ClusterIP backend rather than dropped: the limit is on
+// addresses, and taking the address away must not also break an Ingress that
+// was within its rights.
+func (p *pass) withdrawClaim(c addressClaim) {
+	switch c.ref.gvk {
+	case svcGVK:
+		for i, pair := range p.lbPairs {
+			if pair.hostName == c.hostName {
+				p.lbPairs = append(p.lbPairs[:i], p.lbPairs[i+1:]...)
+				break
+			}
+		}
+		if p.backendNeeded[c.hostName] {
+			guest := p.guestSvcs[c.ref.key]
+			if guest != nil {
+				if backend, refusal := mapService(p.tc, guest, corev1.ServiceTypeClusterIP, p.hostFamilies); refusal == "" {
+					p.services[c.hostName] = backend
+					return // still has host state, so it keeps its finalizer
+				}
+			}
+		}
+		delete(p.services, c.hostName)
+	case gatewayGVK:
+		for i, pair := range p.gatewayPairs {
+			if pair.hostName == c.hostName {
+				p.gatewayPairs = append(p.gatewayPairs[:i], p.gatewayPairs[i+1:]...)
+				break
+			}
+		}
+		delete(p.gateways, c.hostName)
+	}
+	delete(p.wantFinalizer, c.ref)
 }
 
 // reconcileGuestGatewayClass mirrors the one GatewayClass a tenant may name
@@ -403,7 +585,7 @@ func (p *pass) backendResolver(namespace string) func(string) string {
 		if !svc.DeletionTimestamp.IsZero() {
 			return "is being deleted in the guest cluster"
 		}
-		_, refusal := mapService(p.tc, svc, corev1.ServiceTypeClusterIP)
+		_, refusal := mapService(p.tc, svc, corev1.ServiceTypeClusterIP, p.hostFamilies)
 		return refusal
 	}
 }
@@ -420,10 +602,14 @@ func (p *pass) addBackends(namespace string, names []string) {
 			continue // the resolver already refused this path
 		}
 		hostName := HostObjectName(p.tc.Name, namespace, name)
+		// Recorded even when the host Service already exists as a LoadBalancer:
+		// if the address limit later withdraws that claim, this is what tells
+		// withdrawClaim to leave a ClusterIP backend behind instead of nothing.
+		p.backendNeeded[hostName] = true
 		if _, exists := p.services[hostName]; exists {
 			continue
 		}
-		hostSvc, refusal := mapService(p.tc, svc, corev1.ServiceTypeClusterIP)
+		hostSvc, refusal := mapService(p.tc, svc, corev1.ServiceTypeClusterIP, p.hostFamilies)
 		if refusal != "" {
 			continue // ditto
 		}
@@ -514,6 +700,15 @@ func (p *pass) applyService(ctx context.Context, want *corev1.Service) {
 		have.Spec.Type = want.Spec.Type
 		have.Spec.Selector = want.Spec.Selector
 		have.Spec.Ports = reconcilePorts(have.Spec.Ports, want.Spec.Ports)
+		// Address families follow the guest's request on update too, so a tenant
+		// switching a Service to dual-stack gets the second address instead of
+		// having to delete and recreate. Left alone when unset: the host Service's
+		// existing families are then the cluster default and churning them would
+		// re-allocate the address, and the address IS the product.
+		if len(want.Spec.IPFamilies) > 0 {
+			have.Spec.IPFamilies = want.Spec.IPFamilies
+			have.Spec.IPFamilyPolicy = want.Spec.IPFamilyPolicy
+		}
 		if err := p.host.Update(ctx, &have); err != nil {
 			p.applyProblem("Service", want.Name, err)
 			return
@@ -610,8 +805,18 @@ func (p *pass) applyRoute(ctx context.Context, want *gwv1.HTTPRoute) {
 	}
 }
 
+// applyProblem records an apply failure on the TenantCluster AND, when the host
+// object maps back to a guest object, on that guest object.
+//
+// The second half matters more than it looks: the commonest way to fail here is
+// an address family the host API server will not accept, and a rejection landing
+// only on the TenantCluster is invisible to the tenant who asked for it — which
+// is precisely the silent <pending> this design keeps refusing to ship.
 func (p *pass) applyProblem(kind, name string, err error) {
 	p.problems = append(p.problems, fmt.Sprintf("applying host %s %q: %v", kind, name, err))
+	if ref, ok := p.hostOwner[name]; ok {
+		p.refuse(ref, fmt.Sprintf("the host cluster rejected this %s: %v", kind, err))
+	}
 }
 
 // --- prune ------------------------------------------------------------------

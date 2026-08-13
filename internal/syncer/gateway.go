@@ -93,6 +93,29 @@ func mapGateway(tc *v1alpha1.TenantCluster, guest *gwv1.Gateway) (*gwv1.Gateway,
 		return nil, []string{"Gateway sync is not configured for this cluster: the operator has set no gatewayClassName on its TenantCluster registration"}
 	}
 
+	// ADDRESS FAMILIES ON A GATEWAY. Gateway API has no ipFamilies field: the
+	// only way a guest can express one is spec.addresses, by naming a literal
+	// address — and that is a request for a SPECIFIC HOST ADDRESS, which is the
+	// loadBalancerIP hazard the Service syncer already refuses to carry (a
+	// tenant must not be able to claim, or steer itself onto, another tenant's
+	// address). So it is refused rather than copied.
+	//
+	// Refused VISIBLY, though, and that is the point: dropping it silently would
+	// leave a guest that asked for an IPv6 Gateway holding an IPv4 one with
+	// nothing anywhere saying why.
+	if len(guest.Spec.Addresses) > 0 {
+		var asked []string
+		for _, a := range guest.Spec.Addresses {
+			if a.Value != "" {
+				asked = append(asked, a.Value)
+			}
+		}
+		refusals = append(refusals, fmt.Sprintf(
+			"spec.addresses %v refused: the host cluster chooses the address (and therefore the address "+
+				"family) for a Gateway; the assigned addresses are reported in status.addresses",
+			asked))
+	}
+
 	for _, l := range guest.Spec.Listeners {
 		if l.Hostname == nil || *l.Hostname == "" {
 			refusals = append(refusals, fmt.Sprintf(

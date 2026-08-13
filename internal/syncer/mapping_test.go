@@ -41,7 +41,7 @@ func guestLBService(name string, nodePort int32) *corev1.Service {
 
 func TestMapServiceTargetsGuestNodePort(t *testing.T) {
 	tc := testTC()
-	host, refusal := mapService(tc, guestLBService("echo", 31034), corev1.ServiceTypeLoadBalancer)
+	host, refusal := mapService(tc, guestLBService("echo", 31034), corev1.ServiceTypeLoadBalancer, nil)
 	if refusal != "" {
 		t.Fatalf("unexpected refusal: %s", refusal)
 	}
@@ -73,7 +73,7 @@ func TestMapServiceRefusesWithoutNodePort(t *testing.T) {
 	// No NodePort means no host-reachable path; the refusal must say so rather
 	// than producing a host Service that black-holes traffic.
 	svc := guestLBService("echo", 0)
-	if host, refusal := mapService(testTC(), svc, corev1.ServiceTypeLoadBalancer); host != nil || refusal == "" {
+	if host, refusal := mapService(testTC(), svc, corev1.ServiceTypeLoadBalancer, nil); host != nil || refusal == "" {
 		t.Fatalf("want refusal for missing NodePort, got host=%v refusal=%q", host, refusal)
 	}
 }
@@ -85,7 +85,7 @@ func TestMapServiceDropsGuestAnnotationsAndLoadBalancerIP(t *testing.T) {
 	svc := guestLBService("echo", 31034)
 	svc.Annotations = map[string]string{"lbipam.example.com/pool": "someone-elses-pool"}
 	svc.Spec.LoadBalancerIP = "192.0.2.99"
-	host, _ := mapService(testTC(), svc, corev1.ServiceTypeLoadBalancer)
+	host, _ := mapService(testTC(), svc, corev1.ServiceTypeLoadBalancer, nil)
 	if len(host.Annotations) != 0 {
 		t.Errorf("guest annotations must not reach the host Service: %v", host.Annotations)
 	}

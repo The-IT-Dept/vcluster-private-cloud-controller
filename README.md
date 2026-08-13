@@ -109,6 +109,14 @@ spec:
   ingressClassName: nginx     # host ingress class stamped on synced Ingresses
   # gatewayClassName: host-gw # required if syncing Gateways
 
+  # ADDRESS LIMITS. How many host objects this tenant may hold that consume a
+  # pool address — LoadBalancer Services and Gateways TOGETHER. Absent means
+  # unlimited. A public IP pool is usually small (a /29 is six usable
+  # addresses), and a tenant with cluster-admin in their own cluster can
+  # otherwise create a hundred LoadBalancers and exhaust the region.
+  limits:
+    loadBalancers: 3
+
   sync:
     services: true
     ingresses: true
@@ -122,6 +130,54 @@ spec:
 
 Because the `TenantCluster` lives on the host, a tenant can never edit their
 own `allowedDomains` — that is what makes it an authority rather than a hint.
+
+### Address families
+
+Guest Services carry `ipFamilyPolicy` and `ipFamilies` through to the host
+Service, so a guest that asks for IPv6 gets IPv6 and a dual-stack guest gets
+both — rather than silently receiving whatever the host's default family is.
+**Every** allocated address is written back into the guest's
+`status.loadBalancer.ingress`, not just the first.
+
+Three ways it can fail, and all three are visible on the guest object rather
+than a `<pending>` with no reason:
+
+| | what the guest is told |
+|---|---|
+| host cannot allocate that family at all | refused up front: `address family IPv6 refused: the host cluster cannot allocate IPv6 addresses (it provides IPv4)`. Discovered from the host's `ServiceCIDR` objects; if that lookup cannot answer, the request is passed through for the host API server to judge rather than refused on a guess. |
+| host has the family but no address left | `AddressPartiallyAssigned` / `AddressPending`, naming the family that did not arrive |
+| host API server rejects the object | the rejection is copied onto the guest object, not just the `TenantCluster` the tenant cannot read |
+
+**Gateways are different, and it is worth knowing why.** Gateway API has no
+`ipFamilies` field. The only way a guest can express a family is
+`spec.addresses`, which does it by naming a literal host address — the same
+`loadBalancerIP` hazard the Service syncer refuses to carry, since it would let
+a tenant claim or steer onto an address that is not theirs. So a guest
+`spec.addresses` is **refused visibly** and the host chooses; whatever it
+assigns is written back to `status.addresses` in full. In practice the family a
+Gateway gets is whatever the host's Gateway implementation puts on its derived
+LoadBalancer Service.
+
+### Address limits
+
+`spec.limits.loadBalancers` caps how many **logical endpoints** a tenant may
+publish. A dual-stack Service takes an IPv4 and an IPv6 but counts **once**: it
+is one thing a customer asked for, and the scarce family is IPv4.
+
+- **Deterministic and stable.** Endpoints are ordered by creation timestamp,
+  ties broken by UID, and the ones past the limit are refused. Which endpoint
+  is refused cannot change between reconciles — otherwise a tenant's working
+  endpoint would cycle up and down as the controller re-sorted a map.
+- **Lowering a limit tears nothing down.** Endpoints already published on the
+  host are grandfathered; the limit stops growth. An operator must be able to
+  stop a tenant growing without a customer's production endpoint disappearing
+  because someone edited a number.
+- **The refusal is visible in the guest**, with the limit and the current
+  count, exactly as a rejected hostname is.
+- A LoadBalancer Service refused by the limit but referenced by a synced
+  Ingress is **downgraded to a ClusterIP backend**, not dropped: the limit is
+  on addresses, and taking the address away must not also break an Ingress
+  that was within its rights.
 
 ### Hostname authority
 
@@ -259,6 +315,11 @@ gets `GatewayAPIAvailable: False` in status and the other syncers carry on.
   and a tenant must not steer those.
 - `externalTrafficPolicy: Local` is not propagated; client source IPs are not
   preserved through the guest NodePort hop either way.
+- Guest `Gateway.spec.addresses` is refused, not carried: address (and
+  therefore address-family) selection for a Gateway belongs to the host.
+- Address-family discovery reads the host's `ServiceCIDR` objects
+  (`networking.k8s.io/v1`, Kubernetes 1.33+). Without them the syncer cannot
+  tell what the host supports and passes every request through.
 
 ### Install
 

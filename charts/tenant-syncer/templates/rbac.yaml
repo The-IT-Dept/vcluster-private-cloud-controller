@@ -31,6 +31,13 @@ rules:
   - apiGroups: ["networking.k8s.io"]
     resources: ["ingresses"]
     verbs: ["get", "list", "watch", "create", "update", "patch", "delete"]
+  # READ-ONLY, and the whole of the address-family discovery surface: which IP
+  # families the host cluster can allocate at all. Without it a guest asking for
+  # a family the host does not have would sit <pending> with no explanation
+  # instead of being refused with one.
+  - apiGroups: ["networking.k8s.io"]
+    resources: ["servicecidrs"]
+    verbs: ["get", "list", "watch"]
   # Granted even where the CRDs are absent: RBAC on a missing group is inert,
   # and installing Gateway API later must not require a chart upgrade.
   - apiGroups: ["gateway.networking.k8s.io"]

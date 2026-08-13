@@ -74,6 +74,9 @@ func (p *pass) writeBackServices(ctx context.Context) {
 		if host == nil {
 			continue // collision or apply failure; already reported
 		}
+		// EVERY allocated address, not the first. A dual-stack Service has two
+		// entries here, and truncating to one hides the address half the internet
+		// reaches it on.
 		var ingress []corev1.LoadBalancerIngress
 		for _, in := range host.Status.LoadBalancer.Ingress {
 			// IP and Hostname only. The host entry's ports/ipMode describe the
@@ -82,16 +85,29 @@ func (p *pass) writeBackServices(ctx context.Context) {
 		}
 		g := pair.guest
 		cond := metav1.Condition{Type: HostAddressCondition, ObservedGeneration: g.Generation}
-		if len(ingress) > 0 {
+		// Reported PER FAMILY. A dual-stack Service holding only its IPv4 is not
+		// "assigned" — it is half-published, and the guest has to be able to tell
+		// that apart from success without counting entries itself.
+		missing := missingFamilies(host.Spec.IPFamilies, ingress)
+		switch {
+		case len(ingress) > 0 && len(missing) == 0:
 			cond.Status = metav1.ConditionTrue
 			cond.Reason = "AddressAssigned"
 			cond.Message = fmt.Sprintf("the host cluster assigned %s", describeIngress(ingress))
-		} else {
+		case len(ingress) > 0:
+			cond.Status = metav1.ConditionFalse
+			cond.Reason = "AddressPartiallyAssigned"
+			cond.Message = fmt.Sprintf(
+				"the host cluster assigned %s but has no %s address to give; the host's %s pool is exhausted",
+				describeIngress(ingress), describeFamilies(missing), describeFamilies(missing))
+		default:
 			// Never a silent nothing: while the host pool has no address to give,
 			// the guest Service says so instead of just sitting <pending>.
 			cond.Status = metav1.ConditionFalse
 			cond.Reason = "AddressPending"
-			cond.Message = "waiting for the host cluster to assign an address; if this persists, the host address pool may be exhausted"
+			cond.Message = fmt.Sprintf(
+				"waiting for the host cluster to assign a %s address; if this persists, the host address pool is exhausted",
+				describeFamilies(requestedFamilies(host)))
 		}
 		changed := !equality.Semantic.DeepEqual(g.Status.LoadBalancer.Ingress, ingress)
 		g.Status.LoadBalancer.Ingress = ingress
@@ -115,11 +131,49 @@ func describeIngress(ingress []corev1.LoadBalancerIngress) string {
 		}
 		if in.IP != "" {
 			out += in.IP
+			if f := familyOf(in.IP); f != "" {
+				out += " (" + string(f) + ")"
+			}
 		} else {
 			out += in.Hostname
 		}
 	}
 	return out
+}
+
+// requestedFamilies is what the host Service asked for, defaulting to whatever
+// it was actually given families for — an empty ipFamilies means "the cluster
+// default", which the guest should not be told a made-up answer about.
+func requestedFamilies(host *corev1.Service) []corev1.IPFamily {
+	if len(host.Spec.IPFamilies) > 0 {
+		return host.Spec.IPFamilies
+	}
+	return nil
+}
+
+// missingFamilies is the requested families with no allocated address yet.
+// Only meaningful once the families are explicit: with none set, the host
+// decided, and any one address satisfies it.
+func missingFamilies(want []corev1.IPFamily, have []corev1.LoadBalancerIngress) []corev1.IPFamily {
+	if len(want) == 0 {
+		return nil
+	}
+	got := map[corev1.IPFamily]bool{}
+	for _, in := range have {
+		if in.IP == "" {
+			// A hostname satisfies every family: what it resolves to is DNS's
+			// business, not something this controller can decompose.
+			return nil
+		}
+		got[familyOf(in.IP)] = true
+	}
+	var missing []corev1.IPFamily
+	for _, w := range want {
+		if !got[w] {
+			missing = append(missing, w)
+		}
+	}
+	return missing
 }
 
 func (p *pass) writeBackIngresses(ctx context.Context) {

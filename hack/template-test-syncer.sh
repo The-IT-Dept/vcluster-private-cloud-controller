@@ -94,4 +94,36 @@ APPVER="$(awk '/^appVersion:/ {print $2}' "$CHART/Chart.yaml")"
 grep -q -- "--csi-node-image=ghcr.io/the-it-dept/vcluster-private-cloud-controller-csi-node:$APPVER" "$OUT" \
   || fail "csi node image must default to the chart appVersion"
 
+# ServiceCIDRs are the address-family discovery surface and must stay READ-ONLY:
+# the syncer needs to know which families the host can allocate, and has no
+# business editing a cluster's service ranges.
+python3 - "$OUT" <<'EOF'
+import sys, yaml
+docs = [d for d in yaml.safe_load_all(open(sys.argv[1])) if d]
+seen = False
+for d in docs:
+    if d["kind"] != "ClusterRole":
+        continue
+    for rule in d["rules"]:
+        if "servicecidrs" in rule.get("resources", []):
+            seen = True
+            assert set(rule["verbs"]) <= {"get", "list", "watch"}, \
+                f"servicecidrs must be read-only, got {rule['verbs']}"
+assert seen, "servicecidrs RBAC missing: address-family discovery would silently go permissive"
+EOF
+[ $? = 0 ] || fail "servicecidrs RBAC wrong"
+
+# The address limit is an OPERATOR control. It must exist in the CRD and must
+# not be something a tenant could be handed by another route.
+python3 - "$CHART/crds/vcluster.the-it-dept.io_tenantclusters.yaml" <<'EOF'
+import sys, yaml
+crd = yaml.safe_load(open(sys.argv[1]))
+spec = crd["spec"]["versions"][0]["schema"]["openAPIV3Schema"]["properties"]["spec"]["properties"]
+lim = spec["limits"]["properties"]["loadBalancers"]
+assert lim["type"] == "integer", lim
+assert lim.get("minimum") == 0, "a negative limit must be rejected by the API server"
+assert "loadBalancers" not in crd["spec"]["versions"][0]["schema"]["openAPIV3Schema"]["properties"]["spec"].get("required", [])
+EOF
+[ $? = 0 ] || fail "limits CRD field wrong"
+
 echo "tenant-syncer template tests passed"

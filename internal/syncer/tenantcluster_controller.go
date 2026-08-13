@@ -3,6 +3,7 @@ package syncer
 import (
 	"context"
 	"fmt"
+	"net"
 	stdsync "sync"
 	"time"
 
@@ -101,6 +102,7 @@ type cachedGuest struct {
 // +kubebuilder:rbac:groups="",resources=namespaces,verbs=get;create
 // +kubebuilder:rbac:groups="",resources=events,verbs=create;patch
 // +kubebuilder:rbac:groups=networking.k8s.io,resources=ingresses,verbs=get;list;watch;create;update;patch;delete
+// +kubebuilder:rbac:groups=networking.k8s.io,resources=servicecidrs,verbs=get;list;watch
 // +kubebuilder:rbac:groups=gateway.networking.k8s.io,resources=gateways;httproutes,verbs=get;list;watch;create;update;patch;delete
 // +kubebuilder:rbac:groups=storage.k8s.io,resources=storageclasses,verbs=get;list;watch
 // +kubebuilder:rbac:groups="",resources=persistentvolumeclaims,verbs=get;list;watch;create;delete
@@ -139,7 +141,8 @@ func (r *TenantClusterReconciler) Reconcile(ctx context.Context, req ctrl.Reques
 	}
 
 	gatewayAPIOnHost := r.hostHasGatewayAPI()
-	p := newPass(&tc, r.Client, r.Reader, guest, gatewayAPIOnHost, r.Hotplug, r.CSIImages, log)
+	hostFamilies := r.hostAddressFamilies(ctx)
+	p := newPass(&tc, r.Client, r.Reader, guest, gatewayAPIOnHost, hostFamilies, r.Hotplug, r.CSIImages, log)
 	if err := p.run(ctx); err != nil {
 		// run only fails on guest API errors; host-side trouble lands in
 		// p.problems. An unreachable guest is DISCONNECTED, and disconnected
@@ -151,6 +154,11 @@ func (r *TenantClusterReconciler) Reconcile(ctx context.Context, req ctrl.Reques
 	now := metav1.Now()
 	tc.Status.LastSyncTime = &now
 	tc.Status.ObservedResources = p.counts
+	tc.Status.LoadBalancerUsage = p.counts.LoadBalancers
+	tc.Status.HostAddressFamilies = nil
+	for _, f := range hostFamilies {
+		tc.Status.HostAddressFamilies = append(tc.Status.HostAddressFamilies, string(f))
+	}
 	setCond(&tc, v1alpha1.CondConnected, metav1.ConditionTrue, "Connected", "the guest API is reachable")
 
 	if tc.SyncGateways() {
@@ -394,6 +402,49 @@ func (r *TenantClusterReconciler) guestClientFor(ctx context.Context, tc *v1alph
 	}
 	r.guests[tc.UID] = cachedGuest{secretRV: sec.ResourceVersion, client: c}
 	return c, nil
+}
+
+// hostAddressFamilies discovers what the HOST cluster can allocate addresses
+// in, from its ServiceCIDR objects (networking.k8s.io/v1). A guest asking for a
+// family the host does not have must be REFUSED with a reason, not left
+// <pending> forever, and this is the generic answer to "does the host do IPv6"
+// — no coupling to whichever LoadBalancer implementation is installed.
+//
+// Returns nil when it cannot tell (older host, no permission, API absent).
+// Nil is deliberately PERMISSIVE: refusing every tenant because a discovery
+// call failed would be a far worse failure than letting the host API server
+// judge the request itself, which it does anyway.
+//
+// Note what this does and does not prove. ServiceCIDRs say the host can express
+// a family at all; whether a pool has addresses left in it is a separate
+// question, answered per family in the Service write-back.
+func (r *TenantClusterReconciler) hostAddressFamilies(ctx context.Context) []corev1.IPFamily {
+	var list netv1.ServiceCIDRList
+	if err := r.Reader.List(ctx, &list); err != nil {
+		return nil
+	}
+	var v4, v6 bool
+	for _, item := range list.Items {
+		for _, cidr := range item.Spec.CIDRs {
+			ip, _, err := net.ParseCIDR(cidr)
+			if err != nil {
+				continue
+			}
+			if ip.To4() != nil {
+				v4 = true
+			} else {
+				v6 = true
+			}
+		}
+	}
+	var out []corev1.IPFamily
+	if v4 {
+		out = append(out, corev1.IPv4Protocol)
+	}
+	if v6 {
+		out = append(out, corev1.IPv6Protocol)
+	}
+	return out
 }
 
 // hostHasGatewayAPI asks the host's RESTMapper, fresh each pass: installing

@@ -116,8 +116,46 @@ type TenantClusterSpec struct {
 	// +optional
 	GatewayClassName string `json:"gatewayClassName,omitempty"`
 
+	// Limits caps what this tenant may consume of scarce HOST resources. Like
+	// AllowedDomains it lives on the host, so a tenant cannot edit it — which is
+	// the whole point: a tenant has cluster-admin in their own cluster and could
+	// otherwise create a hundred LoadBalancer Services.
+	// +optional
+	Limits Limits `json:"limits,omitempty"`
+
 	// +optional
 	Sync SyncConfig `json:"sync,omitempty"`
+}
+
+// Limits caps a tenant's consumption of scarce host resources.
+type Limits struct {
+	// LoadBalancers is the number of host objects this tenant may hold that
+	// CONSUME A POOL ADDRESS: LoadBalancer Services and Gateways together.
+	// Absent means unlimited — the right default for a single-tenant region and
+	// the wrong one for a shared one.
+	//
+	// Counted per LOGICAL ENDPOINT, not per address: a dual-stack Service takes
+	// one IPv4 and one IPv6 but counts once, because it is one thing a customer
+	// asked for. The scarce family is IPv4 and it is what this number really
+	// protects; if IPv6-only ever needs a larger allowance that is a second
+	// field, not a reinterpretation of this one.
+	//
+	// LOWERING IT BELOW CURRENT USAGE TEARS NOTHING DOWN. It stops the tenant
+	// growing; what already runs keeps running. The alternative — an operator
+	// edits a number and a customer's production endpoint disappears — is not a
+	// trade worth having, and it matches how GPU quota already behaves in this
+	// platform.
+	// +optional
+	// +kubebuilder:validation:Minimum=0
+	LoadBalancers *int32 `json:"loadBalancers,omitempty"`
+}
+
+// LoadBalancerLimit resolves the tri-state limit: (value, true) when set.
+func (t *TenantCluster) LoadBalancerLimit() (int, bool) {
+	if t.Spec.Limits.LoadBalancers == nil {
+		return 0, false
+	}
+	return int(*t.Spec.Limits.LoadBalancers), true
 }
 
 // ResourceCounts is how many guest resources the last completed pass saw in
@@ -127,6 +165,11 @@ type ResourceCounts struct {
 	Ingresses  int `json:"ingresses"`
 	Gateways   int `json:"gateways"`
 	HTTPRoutes int `json:"httpRoutes"`
+	// LoadBalancers is the number of LOGICAL ENDPOINTS admitted this pass:
+	// LoadBalancer Services and Gateways together, the thing
+	// spec.limits.loadBalancers caps. Refused ones are not counted.
+	// +optional
+	LoadBalancers int `json:"loadBalancers,omitempty"`
 	// +optional
 	PersistentVolumeClaims int `json:"persistentVolumeClaims,omitempty"`
 }
@@ -145,6 +188,21 @@ type TenantClusterStatus struct {
 
 	// +optional
 	ObservedResources ResourceCounts `json:"observedResources,omitempty"`
+
+	// LoadBalancerUsage is how many logical endpoints (LoadBalancer Services +
+	// Gateways) this tenant currently holds on the host — the number checked
+	// against spec.limits.loadBalancers. Published so an operator can see how
+	// close a tenant is to its cap without counting objects by hand.
+	// +optional
+	LoadBalancerUsage int `json:"loadBalancerUsage,omitempty"`
+
+	// HostAddressFamilies is what the HOST cluster can allocate, discovered from
+	// its ServiceCIDRs. A guest asking for a family not in this list is refused
+	// with a reason instead of sitting <pending> forever. Empty means discovery
+	// found nothing (an older host, or no permission on ServiceCIDRs) and every
+	// family is passed through for the host API server to judge.
+	// +optional
+	HostAddressFamilies []string `json:"hostAddressFamilies,omitempty"`
 
 	// +optional
 	Conditions []metav1.Condition `json:"conditions,omitempty"`

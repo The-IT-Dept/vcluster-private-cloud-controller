@@ -450,3 +450,55 @@ func TestGatewaySpecAddressesRefusedVisibly(t *testing.T) {
 		t.Errorf("the claim must be refused visibly, naming what was asked for: %v", refusals)
 	}
 }
+
+func TestIPFamiliesAnnotationOverridesGuestSpec(t *testing.T) {
+	// The case that makes the annotation necessary: a single-stack IPv4 guest
+	// whose own API server would reject ipFamilies:[IPv6], asking for an IPv6
+	// public address anyway.
+	svc := guestSvc("echo", 31034)
+	svc.Spec.IPFamilies = []corev1.IPFamily{corev1.IPv4Protocol}
+	single := corev1.IPFamilyPolicySingleStack
+	svc.Spec.IPFamilyPolicy = &single
+	svc.Annotations = map[string]string{IPFamiliesAnnotation: "IPv6"}
+
+	host, refusal := mapService(testTC(), svc, corev1.ServiceTypeLoadBalancer,
+		[]corev1.IPFamily{corev1.IPv4Protocol, corev1.IPv6Protocol})
+	if refusal != "" {
+		t.Fatalf("unexpected refusal: %s", refusal)
+	}
+	if len(host.Spec.IPFamilies) != 1 || host.Spec.IPFamilies[0] != corev1.IPv6Protocol {
+		t.Errorf("annotation must win over spec.ipFamilies, got %v", host.Spec.IPFamilies)
+	}
+	if host.Spec.IPFamilyPolicy == nil || *host.Spec.IPFamilyPolicy != corev1.IPFamilyPolicySingleStack {
+		t.Errorf("one family derives SingleStack, got %v", host.Spec.IPFamilyPolicy)
+	}
+}
+
+func TestIPFamiliesAnnotationDualStackDerivesRequire(t *testing.T) {
+	svc := guestSvc("echo", 31034)
+	svc.Annotations = map[string]string{IPFamiliesAnnotation: "IPv4, IPv6"}
+	host, refusal := mapService(testTC(), svc, corev1.ServiceTypeLoadBalancer, nil)
+	if refusal != "" {
+		t.Fatalf("unexpected refusal: %s", refusal)
+	}
+	if len(host.Spec.IPFamilies) != 2 {
+		t.Fatalf("both families expected, got %v", host.Spec.IPFamilies)
+	}
+	// Require, not Prefer: a guest that asked for two and got one has been
+	// handed half of what it asked for.
+	if *host.Spec.IPFamilyPolicy != corev1.IPFamilyPolicyRequireDualStack {
+		t.Errorf("two families derive RequireDualStack, got %v", *host.Spec.IPFamilyPolicy)
+	}
+}
+
+func TestBadIPFamiliesAnnotationIsRefusedNotIgnored(t *testing.T) {
+	// Ignoring a typo would hand the tenant the host default and no reason.
+	for _, bad := range []string{"IPv5", "", "IPv4,IPv4", "ipv6 "} {
+		svc := guestSvc("echo", 31034)
+		svc.Annotations = map[string]string{IPFamiliesAnnotation: bad}
+		host, refusal := mapService(testTC(), svc, corev1.ServiceTypeLoadBalancer, nil)
+		if host != nil || refusal == "" {
+			t.Errorf("%q must be refused, got host=%v refusal=%q", bad, host != nil, refusal)
+		}
+	}
+}

@@ -139,6 +139,30 @@ both — rather than silently receiving whatever the host's default family is.
 **Every** allocated address is written back into the guest's
 `status.loadBalancer.ingress`, not just the first.
 
+**Most guests cannot use `spec.ipFamilies` for this, so there is an annotation
+too.** `spec.ipFamilies` governs the *guest's own* ClusterIP allocation: a
+single-stack IPv4 guest's API server rejects `ipFamilies: [IPv6]` outright
+(`not configured on this cluster`), and the family of a **public** address on
+the host is a different question. So the family of the published endpoint can
+be asked for directly:
+
+```yaml
+apiVersion: v1
+kind: Service
+metadata:
+  name: echo
+  annotations:
+    # IPv4 | IPv6 | IPv4,IPv6 — the families of the HOST address.
+    vcluster.the-it-dept.io/ip-families: "IPv4,IPv6"
+    # Optional; derived otherwise (one family SingleStack, two RequireDualStack).
+    # vcluster.the-it-dept.io/ip-family-policy: RequireDualStack
+spec:
+  type: LoadBalancer
+```
+
+The annotation wins where both are present; an unparseable value is refused
+with a reason rather than quietly falling back to the host default.
+
 Three ways it can fail, and all three are visible on the guest object rather
 than a `<pending>` with no reason:
 

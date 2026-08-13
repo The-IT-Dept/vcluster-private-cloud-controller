@@ -52,6 +52,29 @@ const RefusedAnnotation = "vcluster.the-it-dept.io/refused"
 // discover which hostnames are permitted is to have one refused.
 const AllowedDomainsAnnotation = "vcluster.the-it-dept.io/allowed-domains"
 
+// IPFamiliesAnnotation lets a guest ask which address FAMILIES its published
+// host endpoint should have — "IPv4", "IPv6", or "IPv4,IPv6".
+//
+// It exists because spec.ipFamilies cannot express it on the clusters that
+// actually exist. A single-stack IPv4 guest's API server REJECTS
+// `ipFamilies: [IPv6]` outright ("not configured on this cluster"), because
+// that field governs the GUEST's own ClusterIP allocation — and the family of
+// a PUBLIC address on the host is a different question with a different
+// answer. Found live: every private-nodes guest today is single-stack IPv4
+// while the host pool is dual-stack, so without this a tenant has no way to
+// ask for the IPv6 half of a region it is already being offered.
+//
+// spec.ipFamilies is still honoured and still carried through for guests that
+// can express it; this annotation takes precedence when both are present.
+const IPFamiliesAnnotation = "vcluster.the-it-dept.io/ip-families"
+
+// IPFamilyPolicyAnnotation optionally overrides the policy that goes with
+// IPFamiliesAnnotation. Left unset it is derived — one family is SingleStack,
+// two is RequireDualStack — and "Require" rather than "Prefer" on purpose: a
+// guest that asked for two families and quietly got one has been handed half
+// of what it asked for, which is the whole failure mode §3.5 is about.
+const IPFamilyPolicyAnnotation = "vcluster.the-it-dept.io/ip-family-policy"
+
 // FieldManager identifies this controller's writes.
 const FieldManager = "vcluster-tenant-syncer"
 

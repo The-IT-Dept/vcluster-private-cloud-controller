@@ -110,16 +110,15 @@ func mapService(tc *v1alpha1.TenantCluster, guest *corev1.Service, svcType corev
 	// what a guest asked for its PUBLIC address could leave a host proxy unable
 	// to dial the backend at all.
 	if svcType == corev1.ServiceTypeLoadBalancer {
-		if refusal := unsupportedFamilyRefusal(guest.Spec.IPFamilies, hostFamilies); refusal != "" {
+		families, policy, refusal := requestedAddressFamilies(guest)
+		if refusal != "" {
 			return nil, refusal
 		}
-		if len(guest.Spec.IPFamilies) > 0 {
-			host.Spec.IPFamilies = append([]corev1.IPFamily(nil), guest.Spec.IPFamilies...)
+		if refusal := unsupportedFamilyRefusal(families, hostFamilies); refusal != "" {
+			return nil, refusal
 		}
-		if guest.Spec.IPFamilyPolicy != nil {
-			policy := *guest.Spec.IPFamilyPolicy
-			host.Spec.IPFamilyPolicy = &policy
-		}
+		host.Spec.IPFamilies = families
+		host.Spec.IPFamilyPolicy = policy
 	}
 
 	// Deliberately NOT copied from the guest: annotations, loadBalancerIP, and
@@ -129,6 +128,73 @@ func mapService(tc *v1alpha1.TenantCluster, guest *corev1.Service, svcType corev
 	// operator via the TenantCluster, not to the guest object. loadBalancerIP
 	// is the same request in older spelling.
 	return host, ""
+}
+
+// requestedAddressFamilies works out which families the guest is asking for on
+// its PUBLIC host address, from the annotation first and spec.ipFamilies
+// second. See IPFamiliesAnnotation for why the annotation has to exist at all:
+// a single-stack guest cannot put "IPv6" in spec.ipFamilies, its own API
+// server refuses the object.
+//
+// Returns (nil, nil, "") when the guest expressed no preference, which leaves
+// the host to its default — the pre-existing behaviour, unchanged.
+func requestedAddressFamilies(guest *corev1.Service) ([]corev1.IPFamily, *corev1.IPFamilyPolicy, string) {
+	families := append([]corev1.IPFamily(nil), guest.Spec.IPFamilies...)
+	var policy *corev1.IPFamilyPolicy
+	if guest.Spec.IPFamilyPolicy != nil {
+		p := *guest.Spec.IPFamilyPolicy
+		policy = &p
+	}
+
+	if raw, ok := guest.Annotations[IPFamiliesAnnotation]; ok {
+		parsed, err := parseFamilies(raw)
+		if err != nil {
+			return nil, nil, fmt.Sprintf("annotation %s: %v", IPFamiliesAnnotation, err)
+		}
+		families = parsed
+		// Derived rather than inherited: the guest's own policy describes its
+		// ClusterIP allocation, which has nothing to do with how many families
+		// it wants published on the host.
+		derived := corev1.IPFamilyPolicySingleStack
+		if len(families) > 1 {
+			derived = corev1.IPFamilyPolicyRequireDualStack
+		}
+		policy = &derived
+	}
+	if raw, ok := guest.Annotations[IPFamilyPolicyAnnotation]; ok {
+		p := corev1.IPFamilyPolicy(raw)
+		switch p {
+		case corev1.IPFamilyPolicySingleStack, corev1.IPFamilyPolicyPreferDualStack, corev1.IPFamilyPolicyRequireDualStack:
+			policy = &p
+		default:
+			return nil, nil, fmt.Sprintf(
+				"annotation %s: %q is not a valid policy (SingleStack, PreferDualStack, RequireDualStack)",
+				IPFamilyPolicyAnnotation, raw)
+		}
+	}
+	if len(families) == 0 {
+		return nil, policy, ""
+	}
+	return families, policy, ""
+}
+
+func parseFamilies(raw string) ([]corev1.IPFamily, error) {
+	var out []corev1.IPFamily
+	for _, part := range strings.Split(raw, ",") {
+		switch f := corev1.IPFamily(strings.TrimSpace(part)); f {
+		case corev1.IPv4Protocol, corev1.IPv6Protocol:
+			if containsFamily(out, f) {
+				return nil, fmt.Errorf("%s is listed twice", f)
+			}
+			out = append(out, f)
+		default:
+			return nil, fmt.Errorf("%q is not an address family (want IPv4, IPv6, or IPv4,IPv6)", strings.TrimSpace(part))
+		}
+	}
+	if len(out) == 0 {
+		return nil, fmt.Errorf("no address family given")
+	}
+	return out, nil
 }
 
 // unsupportedFamilyRefusal names the first requested address family the host
